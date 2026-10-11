@@ -34,10 +34,9 @@ leaves the prior generation selected), three crash-recovery scenarios,
 provenance/skip-gate cases, observation tables retaining their original
 generation.
 
-## Device note
+## Device check (after device reboot)
 
-An on-device breakpoint through the freshly published index was attempted
-but the validation device's USB link dropped mid-session (adb: no
-devices/emulators found, did not recover). Mitigation: the index content
-is verified byte-equivalent to ground truth and the translate path was
-exercised offline; device re-check pending reconnection.
+`MainActivity.onCreate` breakpoint driven through the freshly published
+generation-4 index on the Android 15 device (pid 11848, Dalvik): hit on
+thread 1 with the correct runtime class sig
+(`Lcom/wolfs/myapplication/MainActivity;`), thread resumed cleanly.
