@@ -13,19 +13,27 @@ Mechanics per hook:
 
 To also capture doFinal's OUTPUT, pair the entry hook with a
 METHOD_EXIT_WITH_RETURN_VALUE request on the same method (see
-install(..., capture_returns=True)).
+install(..., capture_returns=True)). Exit requests are class-scoped
+(mod_class_only), so exit events fire for every method of the class and
+must be filtered by exact method id at capture time.
+
+Registration state lives in session.bp_registry (per-session, cleared on
+reconnect): every request id maps to its event kind, hook name, target
+class/method/sig, and owner.
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import time
 
 from ...device.jdwp import (
     EVK_BREAKPOINT, EVK_METHOD_EXIT_RET, SP_EVENT_THREAD, JdwpClient,
 )
-from ...errors import ResolveError
+from ...errors import ResolveError, SessionError
 from ...protocol import log_progress
-from ..capture import capture_spec, invoke_meta
+from ..capture import capture_spec, decode_tagged, invoke_meta
 
 GET_ALGO = {"method": "getAlgorithm", "sig": "()Ljava/lang/String;",
             "label": "algorithm"}
@@ -84,58 +92,103 @@ def install(session, names: list[str] | None = None,
         if names and hook["name"] not in names:
             continue
         try:
-            req_ids = _install_one(session.client, hook, capture_returns)
-            entry = {"hook": hook["name"], "request_ids": req_ids}
-            installed.append(entry)
-            for rid in req_ids:
-                session.bp_registry[rid] = {"hook": hook["name"],
-                                            "spec": hook["method"] + hook["sig"]}
-            _hook_by_rid[rid] = hook
+            regs = _install_one(session.client, hook, capture_returns)
         except Exception as e:
             pending.append({"hook": hook["name"], "reason": str(e)[:120]})
+            continue
+        installed.append({"hook": hook["name"],
+                          "request_ids": [r["rid"] for r in regs]})
+        for r in regs:
+            session.bp_registry[r["rid"]] = {
+                "owner": "crypto", "hook": hook["name"], "hook_def": hook,
+                "kind": r["kind"], "phase": r["phase"],
+                "cls": hook["cls"], "type_id": r["type_id"],
+                "method": hook["method"], "sig": hook["sig"],
+                "method_id": r["method_id"],
+                "spec": hook["method"] + hook["sig"]}
     return {"installed": installed, "pending": pending,
             "note": "pending hooks: class not loaded yet; re-install later"}
 
 
-_hook_by_rid: dict[int, dict] = {}
-
-
-def _install_one(c: JdwpClient, hook: dict, capture_returns: bool) -> list[int]:
+def _install_one(c: JdwpClient, hook: dict,
+                 capture_returns: bool) -> list[dict]:
+    """Register entry breakpoint (+ optional class-scoped method-exit) for
+    every loaded class implementing the hooked method. On partial failure,
+    already-registered requests are cleared before re-raising."""
     classes = c.classes_by_signature(hook["cls"])
     if not classes:
         raise ResolveError(f"{hook['cls']} not loaded")
-    rids = []
-    for cls in classes:
-        m = next((m for m in c.rt_methods(cls["type_id"])
-                  if m["name"] == hook["method"]
-                  and m["sig"] == hook["sig"]), None)
-        if not m:
-            raise ResolveError(f"{hook['method']}{hook['sig']} not found")
-        try:
-            lt = c.method_line_table(cls["type_id"], m["id"])
-            idx = lt["lines"][0]["index"] if lt["lines"] else 0
-        except Exception:
-            idx = 0  # no debug info on framework classes: entry = index 0
-        rids.append(c.set_breakpoint(cls["type_id"], m["id"], idx,
-                                     SP_EVENT_THREAD))
-        if capture_returns:
-            rids.append(c.set_event(
-                EVK_METHOD_EXIT_RET, SP_EVENT_THREAD,
-                [c.mod_class_only(cls["type_id"])]))
-    return rids
+    regs = []
+    try:
+        for cls in classes:
+            m = next((m for m in c.rt_methods(cls["type_id"])
+                      if m["name"] == hook["method"]
+                      and m["sig"] == hook["sig"]), None)
+            if not m:
+                raise ResolveError(f"{hook['method']}{hook['sig']} not found")
+            try:
+                lt = c.method_line_table(cls["type_id"], m["id"])
+                idx = lt["lines"][0]["index"] if lt["lines"] else 0
+            except Exception:
+                idx = 0  # no debug info on framework classes: entry = index 0
+            rid = c.set_breakpoint(cls["type_id"], m["id"], idx,
+                                   SP_EVENT_THREAD)
+            regs.append({"rid": rid, "kind": EVK_BREAKPOINT,
+                         "phase": "entry", "type_id": cls["type_id"],
+                         "method_id": m["id"]})
+            if capture_returns:
+                rid = c.set_event(
+                    EVK_METHOD_EXIT_RET, SP_EVENT_THREAD,
+                    [c.mod_class_only(cls["type_id"])])
+                regs.append({"rid": rid, "kind": EVK_METHOD_EXIT_RET,
+                             "phase": "return", "type_id": cls["type_id"],
+                             "method_id": m["id"]})
+    except Exception:
+        for r in regs:
+            try:
+                c.clear_event(r["kind"], r["rid"])
+            except Exception:
+                pass
+        raise
+    return regs
 
 
 def extract_event(session, ev: dict) -> dict | None:
     """Build the compact JSON record for a crypto-hook event. Returns None
-    for unrelated events (caller should still resume the thread)."""
-    hook = _hook_by_rid.get(ev.get("request_id"))
+    for events not owned by the crypto hooks, and for class-scoped exit
+    events of a different method than the hooked one (caller still resumes
+    the thread)."""
+    reg = session.bp_registry.get(ev.get("request_id"))
     thread = ev.get("thread")
-    if hook is None or thread is None:
+    if reg is None or reg.get("owner") != "crypto" or thread is None:
         return None
+    hook = reg["hook_def"]
+    if ev.get("kind_id") == EVK_METHOD_EXIT_RET:
+        loc = ev.get("location") or {}
+        if loc.get("method") != reg.get("method_id"):
+            return None  # class-scoped exit: some other method of the class
+        rec = {"hook": hook["name"], "thread": thread, "phase": "return"}
+        try:  # tagged return_value; frames are not valid at exit
+            rec["return"] = decode_tagged(session.client,
+                                          ev.get("return_value") or {})
+        except Exception as e:
+            rec["capture_error"] = str(e)[:120]
+        return rec
+    return _extract_entry(session, hook, thread)
+
+
+def _extract_entry(session, hook: dict, thread: int) -> dict:
     c = session.client
-    fr = c.thread_frames(thread, 1)[0]
-    rec = {"hook": hook["name"], "thread": thread,
-           "args": capture_spec(c, thread, fr["frame_id"], hook["capture"])}
+    rec = {"hook": hook["name"], "thread": thread, "phase": "entry"}
+    try:
+        frames = c.thread_frames(thread, 1)
+        if not frames:
+            raise SessionError(f"thread {thread} has no frames")
+        fr = frames[0]
+        rec["args"] = capture_spec(c, thread, fr["frame_id"], hook["capture"])
+    except Exception as e:
+        rec["capture_error"] = str(e)[:120]
+        return rec
     # this-object metadata (algorithm, opmode...)
     try:
         this = c.frame_this_object(thread, fr["frame_id"])
@@ -156,38 +209,71 @@ def extract_event(session, ev: dict) -> dict | None:
 
 def _bytes_of(c: JdwpClient, oid: int) -> dict:
     raw = c.byte_array(oid, 4096)
-    import base64
     return {"len": c.array_length(oid), "hex": raw.hex(),
             "b64": base64.b64encode(raw).decode()}
 
 
 def run_watch(session, duration_s: float = 60.0,
               names: list[str] | None = None,
-              capture_returns: bool = False) -> dict:
-    """Blocking watch loop: install hooks, collect events for duration_s,
-    resume threads after each capture, then uninstall."""
+              capture_returns: bool = False,
+              max_events: int = 1000,
+              max_bytes: int = 1 << 20) -> dict:
+    """Blocking watch loop: install hooks, collect events for duration_s
+    (bounded by max_events records / max_bytes of captured JSON), resume
+    suspended threads after each composite, then uninstall every request
+    with its original event kind. Capture/cleanup failures are reported in
+    the result, never swallowed."""
     rep = install(session, names=names, capture_returns=capture_returns)
-    records = []
+    owned = {rid for i in rep["installed"] for rid in i["request_ids"]}
+    records, errors, cleanup_errors = [], [], []
+    captured_bytes, unrelated = 0, 0
+    reason = "duration"
     deadline = time.time() + duration_s
-    while time.time() < deadline:
-        try:
-            ev = session.wait_events(timeout=max(1.0, deadline - time.time()))
-        except Exception as e:
-            log_progress(f"watch loop: {e}")
-            break
-        for e in ev.get("events", []):
-            rec = extract_event(session, e)
-            if rec:
-                records.append(rec)
-            if "thread" in e:
+    try:
+        while time.time() < deadline:
+            try:
+                ev = session.wait_events(
+                    timeout=max(1.0, deadline - time.time()))
+            except Exception as e:
+                if getattr(e, "code", None) != "E_JDWP_TIMEOUT":
+                    reason = "error"
+                    errors.append(f"wait: {str(e)[:120]}")
+                    log_progress(f"watch loop: {e}")
+                break
+            own_threads, other_threads = set(), set()
+            for e in ev.get("events", []):
+                if e.get("request_id") in owned:
+                    if "thread" in e:
+                        own_threads.add(e["thread"])
+                    rec = extract_event(session, e)
+                    if rec:
+                        records.append(rec)
+                        captured_bytes += len(json.dumps(rec))
+                else:
+                    # not ours: report it, but still resume its thread so
+                    # the app is not left stopped on our account
+                    unrelated += 1
+                    if "thread" in e:
+                        other_threads.add(e["thread"])
+            for t in own_threads | other_threads:
                 try:
-                    session.resume(thread=e["thread"])
-                except Exception:
-                    pass
-    for rid in [r for i in rep["installed"] for r in i["request_ids"]]:
-        try:
-            session.delete_breakpoint(rid)
-        except Exception:
-            pass
+                    session.resume(thread=t)
+                except Exception as ex:
+                    errors.append(f"resume {t}: {str(ex)[:80]}")
+            if len(records) >= max_events:
+                reason = "max_events"
+                break
+            if captured_bytes >= max_bytes:
+                reason = "max_bytes"
+                break
+    finally:
+        for rid in owned:
+            try:
+                session.clear_request(rid)
+            except Exception as e:
+                cleanup_errors.append(f"clear {rid}: {str(e)[:120]}")
     return {"records": records, "hits": len(records),
-            "installed": len(rep["installed"]), "pending": rep["pending"]}
+            "installed": len(rep["installed"]), "pending": rep["pending"],
+            "reason": reason, "truncated": reason == "max_bytes",
+            "captured_bytes": captured_bytes, "unrelated": unrelated,
+            "errors": errors, "cleanup_errors": cleanup_errors}

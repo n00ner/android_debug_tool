@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import base64
 
-from ..device.jdwp import JdwpClient, TAG_ARRAY, TAG_STRING, sig_to_tag
+from ..device.jdwp import (
+    JdwpClient, TAG_ARRAY, TAG_NAMES, TAG_STRING, sig_to_tag,
+)
 from ..errors import SessionError
 
 PRIM_TYPES = {"int": 73, "long": 74, "boolean": 90, "byte": 66,
@@ -59,6 +61,26 @@ def capture_spec(c: JdwpClient, thread: int, frame_id: int,
         except Exception as e:  # slot may be invalid for some overloads
             out[label] = {"error": str(e)[:120]}
     return out
+
+
+def decode_tagged(c: JdwpClient, val: dict, *, max_bytes: int = 4096,
+                  max_str: int = 512) -> dict:
+    """Decode a tagged JDWP value (e.g. a METHOD_EXIT_WITH_RETURN_VALUE
+    return_value) to a compact JSON node, mirroring capture_value."""
+    tag, v = val.get("tag"), val.get("v")
+    if tag == TAG_ARRAY:
+        if not v:
+            return {"type": "byte[]", "v": None}
+        raw = c.byte_array(v, max_bytes)
+        return {"type": "byte[]", "len": c.array_length(v),
+                "hex": raw.hex(),
+                "b64": base64.b64encode(raw).decode(),
+                "utf8": _try_utf8(raw),
+                "trunc": c.array_length(v) > max_bytes}
+    if tag == TAG_STRING:
+        return {"type": "string",
+                "v": c.string_value(v, max_str) if v else None}
+    return {"type": TAG_NAMES.get(tag, f"tag_{tag}"), "v": v}
 
 
 def invoke_meta(c: JdwpClient, thread: int, obj: int,
