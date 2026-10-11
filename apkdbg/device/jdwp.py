@@ -202,6 +202,12 @@ class Writer:
     def value(self, tag: int, v):
         """Encode a tagged value (tag byte included)."""
         self.u8(tag)
+        self.value_untagged(tag, v)
+
+    def value_untagged(self, tag: int, v):
+        """Encode a value without the tag byte. Used by
+        ObjectReference.SetValues and ClassType.SetValues, whose field
+        values are untagged per spec (the tag is implied by the field)."""
         if tag in TAGS_PRIMITIVE:
             self.buf += struct.pack(TAGS_PRIMITIVE[tag], v)
         elif tag in OBJECT_TAGS:
@@ -614,7 +620,8 @@ class JdwpClient:
         w.u32(len(values))
         for fid, tag, v in values:
             w.field_id(fid)
-            w.value(tag, v)
+            # spec: SetValues field values are untagged (tag implied by field)
+            w.value_untagged(tag, v)
         self.request(CS_OBJECTREF, OR_SETVALUES, bytes(w.buf))
 
     def invoke_object_method(self, obj: int, thread: int, class_id: int,
