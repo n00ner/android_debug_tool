@@ -32,17 +32,18 @@ CS_EVENTREQUEST, CS_STACKFRAME, CS_EVENT = 15, 16, 64
 VM_VERSION, VM_CLASSES_BY_SIG, VM_ALL_THREADS, VM_IDSIZES = 1, 2, 4, 7
 VM_SUSPEND, VM_RESUME, VM_CREATE_STRING = 8, 9, 11
 # ReferenceType commands
-RT_FIELDS, RT_METHODS, RT_GETVALUES = 4, 5, 6
+RT_SIGNATURE, RT_FIELDS, RT_METHODS, RT_GETVALUES = 1, 4, 5, 6
 # ClassType commands
-CT_INVOKE = 3
+CT_SUPERCLASS, CT_INVOKE = 1, 3
 # Method commands
 M_LINETABLE, M_VARTABLE = 1, 2
-# ObjectReference commands
-OR_REFTYPE, OR_GETVALUES, OR_SETVALUES, OR_INVOKE = 1, 2, 3, 9
+# ObjectReference commands (spec: InvokeMethod is cmd 6; cmd 9 is unused on
+# ART and answers with a 1-byte NOT_IMPLEMENTED-style reply)
+OR_REFTYPE, OR_GETVALUES, OR_SETVALUES, OR_INVOKE = 1, 2, 3, 6
 # StringReference
 SR_VALUE = 1
 # ThreadReference
-TR_NAME, TR_SUSPEND, TR_RESUME, TR_FRAMES = 1, 2, 3, 6
+TR_NAME, TR_SUSPEND, TR_RESUME, TR_FRAMES, TR_FRAMECOUNT = 1, 2, 3, 6, 7
 # ArrayReference
 AR_LENGTH, AR_GETVALUES = 1, 2
 # EventRequest
@@ -176,6 +177,7 @@ class Writer:
     def u8(self, v): self.buf.append(v & 0xFF)
     def u16(self, v): self.buf += struct.pack(">H", v)
     def u32(self, v): self.buf += struct.pack(">I", v)
+    def i32(self, v): self.buf += struct.pack(">i", v)  # signed; e.g. -1 = "all"
     def u64(self, v): self.buf += struct.pack(">Q", v)
 
     def string(self, s: str):
@@ -201,10 +203,16 @@ class Writer:
     def value(self, tag: int, v):
         """Encode a tagged value (tag byte included)."""
         self.u8(tag)
+        self.value_untagged(tag, v)
+
+    def value_untagged(self, tag: int, v):
+        """Encode a value without the tag byte. Used by
+        ObjectReference.SetValues and ClassType.SetValues, whose field
+        values are untagged per spec (the tag is implied by the field)."""
         if tag in TAGS_PRIMITIVE:
             self.buf += struct.pack(TAGS_PRIMITIVE[tag], v)
         elif tag in OBJECT_TAGS:
-            self.object_id(v)
+            self.object_id(v if v is not None else 0)  # None = null ref
         elif tag == TAG_VOID:
             pass
         else:
@@ -238,6 +246,13 @@ class JdwpClient:
     # -- connection ----------------------------------------------------------
     def connect(self) -> None:
         try:
+            self._connect()
+        except Exception:
+            self._abort_connect()
+            raise
+
+    def _connect(self) -> None:
+        try:
             self.sock = socket.create_connection((self.host, self.port),
                                                  timeout=self.timeout)
             self.sock.sendall(HANDSHAKE)
@@ -247,7 +262,6 @@ class JdwpClient:
                 f"JDWP connect to {self.host}:{self.port} failed: {e}",
                 hint="is the app debuggable and forwarded? (adb forward tcp:P jdwp:PID)")
         if resp != HANDSHAKE:
-            self.sock.close()
             raise JdwpConnError("JDWP handshake rejected",
                                 hint=f"got {resp!r}")
         self.sock.settimeout(None)  # reader thread blocks; requests have own timeouts
@@ -261,6 +275,25 @@ class JdwpClient:
         self.handshake_info = {"description": vr.string(),
                                "jdwp_major": vr.u32(), "jdwp_minor": vr.u32(),
                                "vm_version": vr.string(), "vm_name": vr.string()}
+
+    def _abort_connect(self) -> None:
+        """Cleanup for a failed connect(): a failed attempt must not leak
+        the socket or leave a reader thread behind (a context manager's
+        __exit__ never runs when __enter__ raises)."""
+        self._alive = False
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)  # unblock a pending recv
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        t = self._reader_t
+        if t is not None and t.is_alive():
+            t.join(timeout=2)
+        self.sock = None
 
     def close(self) -> None:
         self._alive = False
@@ -301,20 +334,24 @@ class JdwpClient:
         try:
             while self._alive:
                 hdr = self._recv_exact(11)
-                length, pid, flags = struct.unpack(">IIB", hdr)
+                length, pid, flags = struct.unpack_from(">IIB", hdr, 0)
                 rest = self._recv_exact(length - 11)
                 if flags & FLAG_REPLY:
-                    error = struct.unpack_from(">H", rest, 0)[0]
+                    # reply header includes the 2-byte error code in hdr
+                    error = struct.unpack_from(">H", hdr, 9)[0]
                     slot = self._pending.pop(pid, None)
                     if slot is not None:
-                        slot["error"], slot["data"] = error, rest[2:]
+                        slot["error"], slot["data"] = error, rest
                         slot["event"].set()
                 else:
-                    cmdset, cmd = rest[0], rest[1]
+                    # command header: last 2 bytes of hdr are cmdset + cmd
+                    cmdset, cmd = hdr[9], hdr[10]
                     if cmdset == CS_EVENT and cmd == EV_COMPOSITE:
-                        self._events.put(self._parse_composite(rest[2:]))
+                        self._events.put(self._parse_composite(rest))
         except JdwpConnError as e:
             self._dead = e
+        except Exception as e:  # decoder bugs must not kill diagnostics
+            self._dead = JdwpConnError(f"JDWP reader crashed: {e!r}")
         finally:
             self._alive = False
             for pid, slot in list(self._pending.items()):
@@ -369,6 +406,11 @@ class JdwpClient:
         return self.request(CS_VM, VM_CREATE_STRING, bytes(w.buf)).object_id()
 
     # -- reference type / method metadata --------------------------------------
+    def rt_signature(self, type_id: int) -> str:
+        w = Writer(self.sizes)
+        w.reftype_id(type_id)
+        return self.request(CS_REFTYPE, RT_SIGNATURE, bytes(w.buf)).string()
+
     def rt_methods(self, type_id: int) -> list[dict]:
         w = Writer(self.sizes)
         w.reftype_id(type_id)
@@ -388,6 +430,17 @@ class JdwpClient:
             out.append({"id": r.field_id(), "name": r.string(),
                         "sig": r.string(), "mod_bits": r.u32()})
         return out
+
+    def rt_get_values(self, type_id: int, field_ids: list[int]) -> list[dict]:
+        """ReferenceType.GetValues — for STATIC fields. Passing static field
+        IDs to ObjectReference.GetValues makes ART drop the connection."""
+        w = Writer(self.sizes)
+        w.reftype_id(type_id)
+        w.u32(len(field_ids))
+        for f in field_ids:
+            w.field_id(f)
+        r = self.request(CS_REFTYPE, RT_GETVALUES, bytes(w.buf))
+        return [r.value() for _ in range(r.u32())]
 
     def method_line_table(self, type_id: int, method_id: int) -> dict:
         """DEX LineNumberTable: bytecode index -> line number. This is the
@@ -488,11 +541,18 @@ class JdwpClient:
             ev: dict = {"kind": EVENT_KIND_NAMES.get(kind, f"kind_{kind}"),
                         "kind_id": kind, "request_id": r.u32()}
             if kind in (EVK_SINGLE_STEP, EVK_BREAKPOINT, EVK_METHOD_ENTRY,
-                        EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET, EVK_EXCEPTION):
+                        EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET):
                 ev["thread"] = r.object_id()
                 ev["location"] = r.location()
                 if kind == EVK_METHOD_EXIT_RET:
                     ev["return_value"] = r.value()
+            elif kind == EVK_EXCEPTION:
+                # layout: thread, throw location, tagged exception object,
+                # catch location (zeroed when uncaught)
+                ev["thread"] = r.object_id()
+                ev["location"] = r.location()
+                ev["exception"] = r.value()
+                ev["catch_location"] = r.location()
             elif kind in (EVK_THREAD_START, EVK_THREAD_DEATH, EVK_VM_INIT):
                 ev["thread"] = r.object_id()
             elif kind == EVK_CLASS_PREPARE:
@@ -510,8 +570,7 @@ class JdwpClient:
         try:
             item = self._events.get(timeout=timeout)
         except queue.Empty:
-            raise JdwpError("event wait timed out", code="E_JDWP_TIMEOUT") \
-                if False else _timeout_error(timeout)
+            raise _timeout_error(timeout)
         if item is None:
             raise JdwpConnError(f"JDWP connection lost: {self._dead}")
         return item
@@ -532,11 +591,24 @@ class JdwpClient:
         w.object_id(thread)
         self.request(CS_THREADREF, TR_RESUME, bytes(w.buf))
 
-    def thread_frames(self, thread: int, count: int = 32) -> list[dict]:
+    def thread_frame_count(self, thread: int) -> int:
         w = Writer(self.sizes)
         w.object_id(thread)
-        w.u32(0)
-        w.u32(count)
+        return self.request(CS_THREADREF, TR_FRAMECOUNT, bytes(w.buf)).u32()
+
+    def thread_frames(self, thread: int, count: int = 32) -> list[dict]:
+        """Up to `count` frames from the top of the stack. count=-1 (or a
+        count beyond the stack depth) is valid per spec; a positive count
+        is clamped to the actual depth so shallow stacks don't fail with
+        INVALID_LENGTH. Start/length are SIGNED ints on the wire."""
+        if count < 0:
+            length = -1
+        else:
+            length = min(count, self.thread_frame_count(thread))
+        w = Writer(self.sizes)
+        w.object_id(thread)
+        w.i32(0)
+        w.i32(length)
         r = self.request(CS_THREADREF, TR_FRAMES, bytes(w.buf))
         return [{"frame_id": r.frame_id(), "location": r.location()}
                 for _ in range(r.u32())]
@@ -594,7 +666,8 @@ class JdwpClient:
         w.u32(len(values))
         for fid, tag, v in values:
             w.field_id(fid)
-            w.value(tag, v)
+            # spec: SetValues field values are untagged (tag implied by field)
+            w.value_untagged(tag, v)
         self.request(CS_OBJECTREF, OR_SETVALUES, bytes(w.buf))
 
     def invoke_object_method(self, obj: int, thread: int, class_id: int,
@@ -612,7 +685,55 @@ class JdwpClient:
             w.value(tag, v)
         w.u32(options)
         r = self.request(CS_OBJECTREF, OR_INVOKE, bytes(w.buf))
-        return {"value": r.value(), "exception": r.object_id()}
+        val = r.value()
+        # spec says: exception is an untagged objectID. Android 15's
+        # JVMTI-based JDWP agent emits it as a TAGGED value ('L' + id).
+        remaining = len(r.b) - r.p
+        if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
+            r.u8()  # skip the tag byte
+        return {"value": val, "exception": r.object_id()}
+
+    def ct_superclass(self, class_id: int) -> int:
+        """ClassType.Superclass — returns classID of superclass, 0 for
+        Object/interfaces."""
+        w = Writer(self.sizes)
+        w.reftype_id(class_id)
+        return self.request(CS_CLASSTYPE, CT_SUPERCLASS,
+                            bytes(w.buf)).reftype_id()
+
+    def ct_new_instance(self, class_id: int, thread: int, method_id: int,
+                        args: list[tuple[int, object]] | None = None,
+                        options: int = INVOKE_SINGLE_THREADED) -> dict:
+        """ClassType.NewInstance: allocate + run a constructor. Returns
+        {value: tagged new object, exception: object_id}."""
+        w = Writer(self.sizes)
+        w.reftype_id(class_id)
+        w.object_id(thread)
+        w.method_id(method_id)
+        args = args or []
+        w.u32(len(args))
+        for tag, v in args:
+            w.value(tag, v)
+        w.u32(options)
+        r = self.request(CS_CLASSTYPE, 4, bytes(w.buf))
+        val = r.value()
+        remaining = len(r.b) - r.p
+        if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
+            r.u8()
+        return {"value": val, "exception": r.object_id()}
+
+    def find_method(self, class_id: int, name: str,
+                    sig: str | None = None) -> tuple[int, int]:
+        """Walk the superclass chain for a method (rt_methods only lists
+        DECLARED methods). Returns (defining_class_id, method_id)."""
+        cid = class_id
+        while cid:
+            for m in self.rt_methods(cid):
+                if m["name"] == name and (not sig or m["sig"] == sig):
+                    return cid, m["id"]
+            cid = self.ct_superclass(cid)
+        raise JdwpError(f"method {name}{sig or ''} not found in class "
+                        f"hierarchy of {class_id}")
 
     def string_value(self, obj: int, max_len: int = 4096) -> str:
         w = Writer(self.sizes)
@@ -627,8 +748,11 @@ class JdwpClient:
 
     def array_get_values(self, obj: int, start: int = 0,
                          length: int = 256) -> dict:
-        """Reply: component tag u8, count u32, then elements (raw for
-        primitives, object ids otherwise)."""
+        """Reply: component tag u8, count u32, then elements (untagged for
+        primitive arrays; each reference element carries its own tag)."""
+        if length == 0:
+            # ART rejects zero-length GetValues with an internal error
+            return {"component_tag": 66, "items": [], "inferred": True}
         w = Writer(self.sizes)
         w.object_id(obj)
         w.u32(start)
@@ -639,7 +763,9 @@ class JdwpClient:
         if tag in TAGS_PRIMITIVE:
             items = [r.value(tag)["v"] for _ in range(n)]
         else:
-            items = [{"tag": tag, "v": r.object_id()} for _ in range(n)]
+            # reference elements are individually tagged (runtime types may
+            # differ from the array's component tag, e.g. String in Object[])
+            items = [r.value() for _ in range(n)]
         return {"component_tag": tag, "items": items}
 
     def byte_array(self, obj: int, max_len: int = 65536) -> bytes:

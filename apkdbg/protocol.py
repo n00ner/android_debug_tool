@@ -9,6 +9,7 @@ token burn for LLM consumers.
 from __future__ import annotations
 
 import json
+import math
 import sys
 
 from .errors import ApkDbgError
@@ -25,8 +26,26 @@ def err(exc: Exception) -> dict:
     return {"status": "error", "error": {"code": "E_INTERNAL", "message": str(exc)}}
 
 
+def _sanitize(o):
+    """Replace non-finite floats (legal JDWP float/double values) with an
+    explicit string marker: bare NaN/Infinity are not valid JSON (RFC 8259)
+    and strict clients reject the whole response."""
+    if isinstance(o, float):
+        if math.isfinite(o):
+            return o
+        if math.isnan(o):
+            return "NaN"
+        return "Infinity" if o > 0 else "-Infinity"
+    if isinstance(o, dict):
+        return {k: _sanitize(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_sanitize(v) for v in o]
+    return o
+
+
 def dumps(obj) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=str)
+    return json.dumps(_sanitize(obj), separators=(",", ":"),
+                      ensure_ascii=False, default=str, allow_nan=False)
 
 
 def emit(obj) -> None:

@@ -5,6 +5,7 @@ implement retry/reconnect policy on top."""
 from __future__ import annotations
 
 import re
+import shlex
 import time
 
 from ..errors import AdbError
@@ -61,7 +62,7 @@ class Adb:
 
     # -- app control --------------------------------------------------------
     def pidof(self, package: str) -> int | None:
-        out = self.shell(f"pidof {package}", check=False)
+        out = self.shell(f"pidof {shlex.quote(package)}", check=False)
         if out and out.isdigit():
             return int(out)
         # fallback for older devices without pidof
@@ -83,8 +84,8 @@ class Adb:
                        hint="launch the app first, or use connect --launch")
 
     def main_activity(self, package: str) -> str:
-        out = self.shell(f"cmd package resolve-activity --brief {package}",
-                         check=False)
+        out = self.shell(f"cmd package resolve-activity --brief "
+                         f"{shlex.quote(package)}", check=False)
         lines = [l for l in out.splitlines() if "/" in l]
         if lines:
             return lines[-1].strip()
@@ -93,26 +94,49 @@ class Adb:
     def launch_debug(self, package: str, activity: str | None = None) -> None:
         """Start the app suspended, waiting for a debugger (-D)."""
         activity = activity or self.main_activity(package)
-        self.shell(f"am start -D -n {activity}")
+        # quote for the remote shell: `$` is legal in nested activity
+        # class names (e.g. .Settings$NetworkDashboardActivity)
+        self.shell(f"am start -D -n {shlex.quote(activity)}")
 
     def launch(self, package: str, activity: str | None = None) -> None:
         activity = activity or self.main_activity(package)
-        self.shell(f"am start -n {activity}")
+        self.shell(f"am start -n {shlex.quote(activity)}")
 
     def force_stop(self, package: str) -> None:
-        self.shell(f"am force-stop {package}", check=False)
+        self.shell(f"am force-stop {shlex.quote(package)}", check=False)
 
     # -- transport ----------------------------------------------------------
     def forward_jdwp(self, pid: int, port: int | None = None) -> int:
         """Forward a local TCP port to the app's JDWP transport.
-        Uses a deterministic port derived from the pid so reconnects are
-        idempotent."""
-        port = port or (8700 + pid % 900)
-        self.sh("forward", f"tcp:{port}", f"jdwp:{pid}")
+
+        Without an explicit port, let the adb server allocate a free one
+        (tcp:0) — adb listeners live in the shared host server keyed by
+        local name, so a deterministic pid-derived port collides across
+        processes (pid % 900) and across devices. With an explicit port,
+        --no-rebind refuses to retarget an existing listener instead of
+        silently stealing another session's mapping."""
+        if port is None:
+            out = self.sh("forward", "tcp:0", f"jdwp:{pid}")
+            m = re.search(r"(\d+)", out)
+            if not m:
+                raise AdbError(f"adb reported no allocated port: {out!r}")
+            return int(m.group(1))
+        self.sh("forward", "--no-rebind", f"tcp:{port}", f"jdwp:{pid}")
         return port
 
     def remove_forward(self, port: int) -> None:
         self.sh("forward", "--remove", f"tcp:{port}", check=False)
+
+    def reconnect(self) -> None:
+        """Recover from stale adbd/host state (e.g. a previous debugger
+        detached uncleanly and the VM refuses new JDWP handshakes)."""
+        self.sh("reconnect", check=False, timeout=20)
+
+    def kill_server(self) -> None:
+        """Last-resort recovery: restart the host adb daemon. Clears stale
+        jdwp-forward bookkeeping that survives `adb reconnect` (observed on
+        MIUI/adbd 1.0.41)."""
+        run([self.bin, "kill-server"], timeout=15, tool="adb", check=False)
 
     def push(self, local: str, remote: str, timeout: int = 120) -> None:
         self.sh("push", local, remote, timeout=timeout)
