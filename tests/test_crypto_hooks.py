@@ -37,6 +37,10 @@ class FakeJdwpClient:
         self.cleared = []        # (kind, request_id)
         self.resumed = []        # thread ids
         self.var_tables = {}     # (type_id, method_id) -> vartable
+        self.obj_classes = {}    # oid -> runtime type_id
+        self.fields = {}         # type_id -> [{"id","name","sig","mod_bits"}]
+        self.obj_values = {}     # (oid, field_id) -> tagged value
+        self.this_obj = None     # oid returned by frame_this_object
         self.fail_set_event = False
         self.fail_thread_frames = False
 
@@ -101,7 +105,24 @@ class FakeJdwpClient:
                 for slot, tag in slots]
 
     def frame_this_object(self, thread, frame_id):
-        return {"tag": 76, "v": None}
+        return {"tag": 76, "v": self.this_obj}
+
+    def object_reftype(self, obj):
+        return (1, self.obj_classes.get(obj, 1000))
+
+    def rt_fields(self, type_id):
+        return self.fields.get(type_id, [])
+
+    def object_get_values(self, obj, field_ids):
+        return [self.obj_values[(obj, f)] for f in field_ids]
+
+    def ct_superclass(self, class_id):
+        return 0
+
+    def invoke_object_method(self, obj, thread, class_id, method_id,
+                             args, options=1):
+        raise AssertionError(
+            "invoke must not run while exit requests are armed")
 
     def byte_array(self, oid, max_len=65536):
         return self.arrays.get(oid, b"")[:max_len]
@@ -469,6 +490,66 @@ class VregMapTests(unittest.TestCase):
         self.assertEqual(s.bp_registry[rid]["vregs"], {0: 4, 1: 5})
         rec = crypto.extract_event(s, bp_event(rid))
         self.assertEqual(rec["args"]["input"]["utf8"], "plaintext")
+
+
+class MetaCaptureTests(unittest.TestCase):
+    """Metadata comes from declared field reads (deadlock-free); invokes
+    are suppressed while class-scoped exit requests are armed."""
+
+    def _install_dofinal(self, capture_returns):
+        c = hook_client()
+        c.methods[1000] = [{"name": "doFinal", "sig": "([B)[B", "id": 1500}]
+        c.frames[11] = [{"frame_id": 1, "location": {}}]
+        c.slot_values[(1, 1)] = 9001
+        c.arrays[9001] = b"plaintext"
+        c.this_obj = 7001
+        c.obj_classes[7001] = 2000
+        c.fields[2000] = [{"id": 77, "name": "transformation",
+                           "sig": "Ljava/lang/String;", "mod_bits": 0}]
+        c.obj_values[(7001, 77)] = {"tag": TAG_STRING, "v": 8001}
+        c.strings[8001] = "AES/CBC/PKCS5Padding"
+        s = make_session(c)
+        rep = crypto.install(s, names=["Cipher.doFinal(byte[])"],
+                             capture_returns=capture_returns)
+        rid = rep["installed"][0]["request_ids"][0]
+        return c, s, rid
+
+    def test_meta_via_fields_no_invoke_when_returns_armed(self):
+        c, s, rid = self._install_dofinal(capture_returns=True)
+        self.assertFalse(s.bp_registry[rid]["can_invoke"])
+        rec = crypto.extract_event(s, bp_event(rid, method=1500))
+        # fake invoke_object_method raises if any invoke is attempted
+        self.assertEqual(rec["meta"]["algorithm"], "AES/CBC/PKCS5Padding")
+
+    def test_can_invoke_flag_without_returns(self):
+        c, s, rid = self._install_dofinal(capture_returns=False)
+        self.assertTrue(s.bp_registry[rid]["can_invoke"])
+        rec = crypto.extract_event(s, bp_event(rid, method=1500))
+        self.assertEqual(rec["meta"]["algorithm"], "AES/CBC/PKCS5Padding")
+
+    def test_key_expansion_via_fields(self):
+        c = hook_client()
+        c.frames[11] = [{"frame_id": 1, "location": {}}]
+        c.slot_values[(1, 1)] = 1       # opmode = ENCRYPT_MODE
+        c.slot_values[(1, 2)] = 6001    # key object
+        c.obj_classes[6001] = 3000
+        c.fields[3000] = [
+            {"id": 88, "name": "key", "sig": "[B", "mod_bits": 0},
+            {"id": 89, "name": "algorithm",
+             "sig": "Ljava/lang/String;", "mod_bits": 0}]
+        c.obj_values[(6001, 88)] = {"tag": TAG_ARRAY, "v": 9001}
+        c.obj_values[(6001, 89)] = {"tag": TAG_STRING, "v": 8001}
+        c.arrays[9001] = bytes(range(16))
+        c.strings[8001] = "AES"
+        s = make_session(c)
+        rep = crypto.install(s, names=["Cipher.init(int,Key)"],
+                             capture_returns=True)
+        rid = rep["installed"][0]["request_ids"][0]
+        rec = crypto.extract_event(s, bp_event(rid))
+        key = rec["args"]["key"]
+        self.assertEqual(key["algorithm"], "AES")
+        self.assertEqual(key["encoded"]["hex"], bytes(range(16)).hex())
+        self.assertEqual(rec["args"]["opmode"]["v"], 1)
 
 
 if __name__ == "__main__":

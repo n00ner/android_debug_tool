@@ -118,6 +118,47 @@ def decode_tagged(c: JdwpClient, val: dict, *, max_bytes: int = 4096,
     return {"type": TAG_NAMES.get(tag, f"tag_{tag}"), "v": v}
 
 
+def read_fields(c: JdwpClient, obj: int, specs: list[dict]) -> dict:
+    """Deadlock-free alternative to metadata invokes: read declared
+    instance fields of obj, walking the superclass chain of its runtime
+    class. Each spec: {"name": "algorithm", "label": "algorithm"}.
+    Values decode like invoke_meta results (strings plain, byte[] as
+    capture dicts); missing fields report an error node."""
+    out = {}
+    if not obj:
+        return out
+    try:
+        _, type_id = c.object_reftype(obj)
+    except Exception:
+        return out
+    todo = list(specs)
+    while type_id and todo:
+        try:
+            fields = c.rt_fields(type_id)
+        except Exception:
+            break
+        for spec in list(todo):
+            f = next((f for f in fields if f["name"] == spec["name"]),
+                     None)
+            if f is None:
+                continue
+            todo.remove(spec)
+            try:
+                v = c.object_get_values(obj, [f["id"]])[0]
+                node = decode_tagged(c, v)
+                out[spec["label"]] = node["v"] if node.get(
+                    "type") == "string" else node
+            except Exception as e:
+                out[spec["label"]] = {"error": str(e)[:120]}
+        try:
+            type_id = c.ct_superclass(type_id)
+        except Exception:
+            break
+    for spec in todo:
+        out[spec["label"]] = {"error": f"field {spec['name']!r} not found"}
+    return out
+
+
 def invoke_meta(c: JdwpClient, thread: int, obj: int,
                 invokes: list[dict]) -> dict:
     """Run metadata invokes on `this` (e.g. Cipher.getAlgorithm) while the

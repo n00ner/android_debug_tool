@@ -23,13 +23,17 @@ Registration state lives in session.bp_registry (per-session, cleared on
 reconnect): every request id maps to its event kind, hook name, target
 class/method/sig, and owner.
 
-Metadata invokes (getAlgorithm/getEncoded) run on the event-suspended
-thread with INVOKE_SINGLE_THREADED — a debugger-driven invoke can re-enter
-hooked code or stall behind the thread's own suspension, so the policy is:
-at most the invokes declared per hook, one round-trip each, bounded by the
-client reply timeout; a stalled/failed invoke is reported as meta_error in
-the record and never blocks resume or teardown. Do not add invoke chains
-that call back into hooked methods.
+Metadata (algorithm, encoded key bytes) is captured WITHOUT invokes
+wherever possible: declared instance fields are read directly
+(capture.read_fields), which cannot re-enter hooked code. Metadata
+invokes (getAlgorithm/getEncoded) are used only as a fallback and only
+when install ran with capture_returns=False — with capture_returns=True
+the class-scoped METHOD_EXIT_WITH_RETURN_VALUE requests would suspend the
+invoked thread at its own method exit mid-invoke and the invoke reply
+never arrives (observed on Android 15: every meta invoke stalled until
+the 15s reply timeout). This is the documented reentrancy policy: no
+invoke may run while class-scoped exit requests are armed; a failed
+capture is reported in the record and never blocks resume or teardown.
 """
 
 from __future__ import annotations
@@ -43,33 +47,41 @@ from ...device.jdwp import (
 )
 from ...errors import ResolveError, SessionError
 from ...protocol import log_progress
-from ..capture import arg_vreg_map, capture_spec, decode_tagged, invoke_meta
+from ..capture import (
+    arg_vreg_map, capture_spec, decode_tagged, invoke_meta, read_fields,
+)
 
 GET_ALGO = {"method": "getAlgorithm", "sig": "()Ljava/lang/String;",
             "label": "algorithm"}
 GET_ENCODED = {"method": "getEncoded", "sig": "()[B", "label": "_encoded"}
+# AOSP field names backing the same metadata (read without invokes)
+FLD_ALGO = {"name": "algorithm", "label": "algorithm"}
+FLD_TRANSFORMATION = {"name": "transformation", "label": "algorithm"}
+FLD_KEY = {"name": "key", "label": "_encoded"}
 
 CRYPTO_HOOKS: list[dict] = [
     {"name": "Cipher.doFinal(byte[])",
      "cls": "Ljavax/crypto/Cipher;", "method": "doFinal", "sig": "([B)[B",
      "capture": [{"slot": 1, "type": "byte[]", "label": "input"}],
-     "meta": [GET_ALGO]},
+     "meta": [GET_ALGO], "meta_fields": [FLD_TRANSFORMATION]},
     {"name": "Cipher.doFinal(byte[],int,int)",
      "cls": "Ljavax/crypto/Cipher;", "method": "doFinal",
      "sig": "([BII)[B",
      "capture": [{"slot": 1, "type": "byte[]", "label": "input"},
                  {"slot": 2, "type": "int", "label": "offset"},
                  {"slot": 3, "type": "int", "label": "len"}],
-     "meta": [GET_ALGO]},
+     "meta": [GET_ALGO], "meta_fields": [FLD_TRANSFORMATION]},
     {"name": "Cipher.doFinal()",
      "cls": "Ljavax/crypto/Cipher;", "method": "doFinal", "sig": "()[B",
-     "capture": [], "meta": [GET_ALGO]},
+     "capture": [], "meta": [GET_ALGO], "meta_fields": [FLD_TRANSFORMATION]},
     {"name": "Cipher.init(int,Key)",
      "cls": "Ljavax/crypto/Cipher;", "method": "init",
      "sig": "(ILjava/security/Key;)V",
      "capture": [{"slot": 1, "type": "int", "label": "opmode"},
                  {"slot": 2, "type": "object", "label": "key"}],
-     "meta": [GET_ALGO], "key_invoke": [GET_ALGO, GET_ENCODED]},
+     "meta": [GET_ALGO], "meta_fields": [FLD_TRANSFORMATION],
+     "key_invoke": [GET_ALGO, GET_ENCODED],
+     "key_fields": [FLD_ALGO, FLD_KEY]},
     {"name": "SecretKeySpec.<init>(byte[],String)",
      "cls": "Ljavax/crypto/spec/SecretKeySpec;", "method": "<init>",
      "sig": "([BLjava/lang/String;)V",
@@ -83,12 +95,12 @@ CRYPTO_HOOKS: list[dict] = [
     {"name": "Mac.doFinal(byte[])",
      "cls": "Ljavax/crypto/Mac;", "method": "doFinal", "sig": "([B)[B",
      "capture": [{"slot": 1, "type": "byte[]", "label": "input"}],
-     "meta": [GET_ALGO]},
+     "meta": [GET_ALGO], "meta_fields": [FLD_ALGO]},
     {"name": "MessageDigest.digest(byte[])",
      "cls": "Ljava/security/MessageDigest;", "method": "digest",
      "sig": "([B)[B",
      "capture": [{"slot": 1, "type": "byte[]", "label": "input"}],
-     "meta": [GET_ALGO]},
+     "meta": [GET_ALGO], "meta_fields": [FLD_ALGO]},
 ]
 
 
@@ -115,6 +127,7 @@ def install(session, names: list[str] | None = None,
                 "cls": hook["cls"], "type_id": r["type_id"],
                 "method": hook["method"], "sig": hook["sig"],
                 "method_id": r["method_id"], "vregs": r["vregs"],
+                "can_invoke": not capture_returns,
                 "spec": hook["method"] + hook["sig"]}
     return {"installed": installed, "pending": pending,
             "note": "pending hooks: class not loaded yet; re-install later"}
@@ -202,17 +215,32 @@ def _extract_entry(session, reg: dict, thread: int) -> dict:
     except Exception as e:
         rec["capture_error"] = str(e)[:120]
         return rec
-    # this-object metadata (algorithm, opmode...)
+    # this-object metadata (algorithm, opmode...) — field reads first
+    # (deadlock-free); invokes only when no class-scoped exit requests are
+    # armed, see module docstring
     try:
         this = c.frame_this_object(thread, fr["frame_id"])
-        if this["v"] and hook.get("meta"):
-            rec["meta"] = invoke_meta(c, thread, this["v"], hook["meta"])
-        # Key objects: expand via getEncoded/getAlgorithm
+        if this["v"]:
+            if hook.get("meta_fields"):
+                rec["meta"] = read_fields(c, this["v"],
+                                          hook["meta_fields"])
+            elif hook.get("meta") and reg.get("can_invoke"):
+                rec["meta"] = invoke_meta(c, thread, this["v"],
+                                          hook["meta"])
+        # Key objects: expand via declared fields (or invokes when safe)
         key_node = rec["args"].get("key")
-        if key_node and key_node.get("id") and hook.get("key_invoke"):
-            meta = invoke_meta(c, thread, key_node["id"], hook["key_invoke"])
+        if key_node and key_node.get("id"):
+            if hook.get("key_fields"):
+                meta = read_fields(c, key_node["id"], hook["key_fields"])
+            elif hook.get("key_invoke") and reg.get("can_invoke"):
+                meta = invoke_meta(c, thread, key_node["id"],
+                                   hook["key_invoke"])
+            else:
+                meta = {}
             enc = meta.pop("_encoded", None)
-            if isinstance(enc, int) and enc:
+            if isinstance(enc, dict) and enc.get("hex"):
+                meta["encoded"] = enc
+            elif isinstance(enc, int) and enc:
                 meta["encoded"] = _bytes_of(c, enc)
             rec["args"]["key"].update(meta)
     except Exception as e:
