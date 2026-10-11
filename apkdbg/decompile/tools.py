@@ -38,15 +38,17 @@ def jadx_decompile(apk: str | Path, out_dir: str | Path,
     for flags in JADX_FLAG_SETS:
         proc = run([bin_, "-d", str(out), *flags, str(apk)],
                    timeout=timeout, tool="jadx", check=False)
-        if proc.returncode == 0:
+        # jadx exits non-zero when some methods fail to decompile — normal on
+        # real apps. Judge success by produced sources, not the exit code.
+        n_sources = len(list(out.rglob("*.java"))) if out.exists() else 0
+        if n_sources > 0:
             mapping = _find_mapping_file(out)
-            if flags and "--mappings-json" in flags and not mapping:
-                log_progress("jadx accepted --mappings-json but no mapping "
-                             "file was found; continuing without it")
             return {"tool": "jadx", "out": str(out), "flags": flags,
+                    "java_files": n_sources,
+                    "decompile_errors": proc.returncode != 0,
                     "mapping_file": str(mapping) if mapping else None}
         last_err = (proc.stderr or proc.stdout or "")[-500:]
-    raise DecompileError("jadx failed with all known flag sets",
+    raise DecompileError("jadx produced no sources with any flag set",
                          hint=last_err)
 
 

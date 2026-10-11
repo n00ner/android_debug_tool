@@ -34,7 +34,7 @@ VM_SUSPEND, VM_RESUME, VM_CREATE_STRING = 8, 9, 11
 # ReferenceType commands
 RT_SIGNATURE, RT_FIELDS, RT_METHODS, RT_GETVALUES = 1, 4, 5, 6
 # ClassType commands
-CT_INVOKE = 3
+CT_SUPERCLASS, CT_INVOKE = 1, 3
 # Method commands
 M_LINETABLE, M_VARTABLE = 1, 2
 # ObjectReference commands
@@ -301,20 +301,24 @@ class JdwpClient:
         try:
             while self._alive:
                 hdr = self._recv_exact(11)
-                length, pid, flags = struct.unpack(">IIB", hdr)
+                length, pid, flags = struct.unpack_from(">IIB", hdr, 0)
                 rest = self._recv_exact(length - 11)
                 if flags & FLAG_REPLY:
-                    error = struct.unpack_from(">H", rest, 0)[0]
+                    # reply header includes the 2-byte error code in hdr
+                    error = struct.unpack_from(">H", hdr, 9)[0]
                     slot = self._pending.pop(pid, None)
                     if slot is not None:
-                        slot["error"], slot["data"] = error, rest[2:]
+                        slot["error"], slot["data"] = error, rest
                         slot["event"].set()
                 else:
-                    cmdset, cmd = rest[0], rest[1]
+                    # command header: last 2 bytes of hdr are cmdset + cmd
+                    cmdset, cmd = hdr[9], hdr[10]
                     if cmdset == CS_EVENT and cmd == EV_COMPOSITE:
-                        self._events.put(self._parse_composite(rest[2:]))
+                        self._events.put(self._parse_composite(rest))
         except JdwpConnError as e:
             self._dead = e
+        except Exception as e:  # decoder bugs must not kill diagnostics
+            self._dead = JdwpConnError(f"JDWP reader crashed: {e!r}")
         finally:
             self._alive = False
             for pid, slot in list(self._pending.items()):
@@ -393,6 +397,17 @@ class JdwpClient:
             out.append({"id": r.field_id(), "name": r.string(),
                         "sig": r.string(), "mod_bits": r.u32()})
         return out
+
+    def rt_get_values(self, type_id: int, field_ids: list[int]) -> list[dict]:
+        """ReferenceType.GetValues — for STATIC fields. Passing static field
+        IDs to ObjectReference.GetValues makes ART drop the connection."""
+        w = Writer(self.sizes)
+        w.reftype_id(type_id)
+        w.u32(len(field_ids))
+        for f in field_ids:
+            w.field_id(f)
+        r = self.request(CS_REFTYPE, RT_GETVALUES, bytes(w.buf))
+        return [r.value() for _ in range(r.u32())]
 
     def method_line_table(self, type_id: int, method_id: int) -> dict:
         """DEX LineNumberTable: bytecode index -> line number. This is the
@@ -618,6 +633,27 @@ class JdwpClient:
         r = self.request(CS_OBJECTREF, OR_INVOKE, bytes(w.buf))
         return {"value": r.value(), "exception": r.object_id()}
 
+    def ct_superclass(self, class_id: int) -> int:
+        """ClassType.Superclass — returns classID of superclass, 0 for
+        Object/interfaces."""
+        w = Writer(self.sizes)
+        w.reftype_id(class_id)
+        return self.request(CS_CLASSTYPE, CT_SUPERCLASS,
+                            bytes(w.buf)).reftype_id()
+
+    def find_method(self, class_id: int, name: str,
+                    sig: str | None = None) -> tuple[int, int]:
+        """Walk the superclass chain for a method (rt_methods only lists
+        DECLARED methods). Returns (defining_class_id, method_id)."""
+        cid = class_id
+        while cid:
+            for m in self.rt_methods(cid):
+                if m["name"] == name and (not sig or m["sig"] == sig):
+                    return cid, m["id"]
+            cid = self.ct_superclass(cid)
+        raise JdwpError(f"method {name}{sig or ''} not found in class "
+                        f"hierarchy of {class_id}")
+
     def string_value(self, obj: int, max_len: int = 4096) -> str:
         w = Writer(self.sizes)
         w.object_id(obj)
@@ -633,6 +669,9 @@ class JdwpClient:
                          length: int = 256) -> dict:
         """Reply: component tag u8, count u32, then elements (raw for
         primitives, object ids otherwise)."""
+        if length == 0:
+            # ART rejects zero-length GetValues with an internal error
+            return {"component_tag": 66, "items": [], "inferred": True}
         w = Writer(self.sizes)
         w.object_id(obj)
         w.u32(start)

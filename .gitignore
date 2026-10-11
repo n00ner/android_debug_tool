@@ -8,3 +8,4 @@ dist/
 work/
 *.apk
 mapping.db
+test_scope/

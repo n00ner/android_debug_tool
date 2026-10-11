@@ -15,7 +15,7 @@ from ..device.adb import Adb
 from ..device.jdwp import (
     EVK_BREAKPOINT, EVK_SINGLE_STEP, SP_ALL, SP_EVENT_THREAD,
     STEP_INTO, STEP_LINE, STEP_OUT, STEP_OVER,
-    JdwpClient, JdwpConnError, sig_to_tag, TAG_STRING,
+    JdwpClient, JdwpConnError, JdwpError, sig_to_tag, TAG_STRING,
 )
 from ..errors import ResolveError, SessionError
 from ..protocol import log_progress
@@ -52,10 +52,26 @@ class DebugSession:
                         f"{self.client.handshake_info.get('jdwp_minor')}"}
 
     def _attach(self) -> None:
-        if self.client:
-            self.client.close()
-        self.client = JdwpClient("127.0.0.1", self.port)
-        self.client.connect()
+        """Handshake, with escalating recovery: plain -> adb reconnect ->
+        adb kill-server (stale jdwp state survives unclean debugger
+        disconnects; observed on MIUI)."""
+        last: JdwpConnError | None = None
+        for level in (None, "reconnect", "kill-server"):
+            if level:
+                log_progress(f"JDWP attach recovery: {level}")
+                getattr(self.adb, level.replace("-", "_"))()
+                self.adb.wait_for_device()
+                self.adb.remove_forward(self.port)
+                self.adb.forward_jdwp(self.pid, self.port)
+            if self.client:
+                self.client.close()
+            self.client = JdwpClient("127.0.0.1", self.port)
+            try:
+                self.client.connect()
+                return
+            except JdwpConnError as e:
+                last = e
+        raise last
 
     def _op(self, fn: Callable, *args, **kwargs):
         """Run fn(self.client, ...) with one transparent reconnect retry."""
@@ -221,6 +237,13 @@ class DebugSession:
                         hint="LocalVariableTable names: "
                              + ", ".join(s["name"] for s in vt["slots"])
                              or "(stripped by ProGuard — address by slot)")
+                cur = loc["index"]
+                if not (hit["code_index"] <= cur < hit["code_index"] + hit["length"]):
+                    raise ResolveError(
+                        f"local {name!r} not in scope at bytecode index {cur}",
+                        hint=f"scope: [{hit['code_index']}, "
+                             f"{hit['code_index'] + hit['length']}) — step "
+                             "further into the method")
                 slot_n, tag = hit["slot"], sig_to_tag(hit["sig"])
                 var_name, sig = name, hit["sig"]
             elif slot is not None:
@@ -272,11 +295,11 @@ class DebugSession:
         args: [{"type": "int"|"string"|..., "value": ...}]."""
         def do(c: JdwpClient):
             _, type_id = c.object_reftype(obj)
-            cand = [m for m in c.rt_methods(type_id)
-                    if m["name"] == method and (not sig or m["sig"] == sig)]
-            if not cand:
-                raise ResolveError(f"method {method}{sig} not found on object")
-            m = cand[0]
+            try:
+                def_cls, method_id = c.find_method(type_id, method,
+                                                   sig or None)
+            except JdwpError as e:
+                raise ResolveError(str(e))
             encoded = []
             for a in args or []:
                 t = a.get("type", "int")
@@ -285,8 +308,9 @@ class DebugSession:
                     encoded.append((TAG_STRING, c.create_string(str(v))))
                 else:
                     encoded.append((sig_to_tag(_TYPE_SIGS[t]), v))
-            r = c.invoke_object_method(obj, thread, type_id, m["id"], encoded)
-            out = {"method": method + m["sig"], "exception": r["exception"]}
+            r = c.invoke_object_method(obj, thread, def_cls, method_id,
+                                       encoded)
+            out = {"method": method + (sig or ""), "exception": r["exception"]}
             rv = r["value"]
             out["tag"] = rv["tag"]
             out["value"] = rv["v"]

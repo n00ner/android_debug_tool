@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-RE_CLASS = re.compile(r"^\.class\s+\S+\s+(L[^;\s]+;)")
+RE_CLASS = re.compile(r"^\.class\s+(?:\S+\s+)*?(L[^;\s]+;)\s*$")
 RE_SOURCE = re.compile(r'^\.source\s+"([^"]+)"')
 RE_METHOD = re.compile(r"^\.method\s+(.+?)\s+(\S+?\(.*\)\S+)\s*$")
 RE_LINE = re.compile(r"^\.line\s+(\d+)")

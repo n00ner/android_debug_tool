@@ -51,8 +51,10 @@ class Snapshotter:
             pass
         try:
             vt = self.c.method_var_table(loc["class"], loc["method"])
+            cur = loc["index"]
             slots = [(s["slot"], sig_to_tag(s["sig"]), s["name"])
-                     for s in vt["slots"]]
+                     for s in vt["slots"]
+                     if s["code_index"] <= cur < s["code_index"] + s["length"]]
         except Exception:
             slots = []  # ProGuard-stripped: caller can read by raw slot
         if slots:
@@ -94,6 +96,8 @@ class Snapshotter:
             return {"$ref": oid}
         self._seen.add(oid)
         n = self.c.array_length(oid)
+        if n == 0:
+            return {"arr": [], "len": 0}
         probe = self.c.array_get_values(oid, 0, min(n, self.b.max_items))
         tag = probe["component_tag"]
         if tag == 66:  # byte[]: compact hex instead of per-element nodes
@@ -129,9 +133,16 @@ class Snapshotter:
             return node
         try:
             fields = self.c.rt_fields(type_id)[: self.b.max_fields]
-            vals = self.c.object_get_values(oid, [f["id"] for f in fields])
-            node["f"] = {f["name"]: self._node(v["tag"], v["v"], depth + 1)
-                         for f, v in zip(fields, vals)}
+            inst = [f for f in fields if not f["mod_bits"] & 0x8]
+            stat = [f for f in fields if f["mod_bits"] & 0x8]
+            if inst:
+                vals = self.c.object_get_values(oid, [f["id"] for f in inst])
+                node["f"] = {f["name"]: self._node(v["tag"], v["v"], depth + 1)
+                             for f, v in zip(inst, vals)}
+            if stat:
+                vals = self.c.rt_get_values(type_id, [f["id"] for f in stat])
+                node["s"] = {f["name"]: self._node(v["tag"], v["v"], depth + 1)
+                             for f, v in zip(stat, vals)}
         except Exception as e:
             node["fields_error"] = str(e)[:80]
         return node

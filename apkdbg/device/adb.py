@@ -114,6 +114,17 @@ class Adb:
     def remove_forward(self, port: int) -> None:
         self.sh("forward", "--remove", f"tcp:{port}", check=False)
 
+    def reconnect(self) -> None:
+        """Recover from stale adbd/host state (e.g. a previous debugger
+        detached uncleanly and the VM refuses new JDWP handshakes)."""
+        self.sh("reconnect", check=False, timeout=20)
+
+    def kill_server(self) -> None:
+        """Last-resort recovery: restart the host adb daemon. Clears stale
+        jdwp-forward bookkeeping that survives `adb reconnect` (observed on
+        MIUI/adbd 1.0.41)."""
+        run([self.bin, "kill-server"], timeout=15, tool="adb", check=False)
+
     def push(self, local: str, remote: str, timeout: int = 120) -> None:
         self.sh("push", local, remote, timeout=timeout)
 
