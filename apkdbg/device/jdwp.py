@@ -702,8 +702,8 @@ class JdwpClient:
 
     def array_get_values(self, obj: int, start: int = 0,
                          length: int = 256) -> dict:
-        """Reply: component tag u8, count u32, then elements (raw for
-        primitives, object ids otherwise)."""
+        """Reply: component tag u8, count u32, then elements (untagged for
+        primitive arrays; each reference element carries its own tag)."""
         if length == 0:
             # ART rejects zero-length GetValues with an internal error
             return {"component_tag": 66, "items": [], "inferred": True}
@@ -717,7 +717,9 @@ class JdwpClient:
         if tag in TAGS_PRIMITIVE:
             items = [r.value(tag)["v"] for _ in range(n)]
         else:
-            items = [{"tag": tag, "v": r.object_id()} for _ in range(n)]
+            # reference elements are individually tagged (runtime types may
+            # differ from the array's component tag, e.g. String in Object[])
+            items = [r.value() for _ in range(n)]
         return {"component_tag": tag, "items": items}
 
     def byte_array(self, obj: int, max_len: int = 65536) -> bytes:
