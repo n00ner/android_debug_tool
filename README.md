@@ -102,6 +102,41 @@ apkdbg --project ./proj serve
   without a mapping json the dalvik-line identity pivot is used (exact for
   non-recompiled debuggable APKs).
 
+## Troubleshooting
+
+**JDWP handshake fails with EOF / connection drops immediately.**
+The most common cause is a **scrcpy-bundled adb server**: it wedges the
+`forward`/`jdwp` path so the socket opens and dies instantly. Point apkdbg
+at the SDK platform-tools adb instead (and `kill-server` the scrcpy one):
+
+```bash
+export APKDBG_ADB="C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+"$APKDBG_ADB" kill-server && "$APKDBG_ADB" start-server
+```
+
+**adb in a bad state mid-session.** apkdbg's connect path already walks a
+recovery ladder (`get-state` probe → `reconnect` → `kill-server`/`start-server`
+→ relaunch), but if you run adb by hand: `adb kill-server`, replug or
+`adb reconnect`, verify with `adb devices -l` and `adb shell pidof <pkg>`
+before retrying.
+
+**ART JDWP quirks (handled internally, listed for reference):**
+
+- *Tagged exception field (Android 15+).* The spec says invoke replies carry
+  an untagged exception objectID; Android 15's JVMTI-based JDWP agent emits it
+  as a tagged value (`'L' + id`). The client parses both forms.
+- *InvokeMethod opcode.* On Android 10+ JDWP runs as a JVMTI agent; the
+  spec-correct ObjectReference.InvokeMethod command is **6**. Sending the old
+  cmd 9 gets a 1-byte error-style reply.
+- *Static-field reads can drop the connection* on some ART builds — the
+  session splits static/instance field access and treats a drop here as
+  reconnectable rather than fatal.
+- *Zero-length arrays* report error 503 (`INVALID_INDEX`) from
+  `ArrayReference.GetValues` instead of an empty list — surfaced as an empty
+  array, not an error.
+- *SINGLE_STEP coverage* requires the Step (size/depth) modifier on the event
+  request; ART silently never fires the request without it.
+
 ## Current status / roadmap
 
 Implemented: init pipeline, mapping DB, JDWP bridge, Perfect Sync breakpoints,
