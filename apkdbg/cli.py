@@ -25,11 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--serial", default=None, help="adb device serial")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("init", help="decompile APK and build mapping DB")
+    sp = sub.add_parser("init", help="decompile APK and build mapping DB "
+                                     "(transactional re-index)")
     sp.add_argument("--apk", required=True)
     sp.add_argument("--out", default=".")
-    sp.add_argument("--skip-apktool", action="store_true")
-    sp.add_argument("--skip-jadx", action="store_true")
+    sp.add_argument("--skip-apktool", action="store_true",
+                    help="reuse cached apktool output (must match the APK's "
+                         "recorded provenance)")
+    sp.add_argument("--skip-jadx", action="store_true",
+                    help="reuse cached jadx output (same provenance rule)")
 
     sp = sub.add_parser("classes", help="search classes in mapping DB")
     sp.add_argument("--filter", default="")

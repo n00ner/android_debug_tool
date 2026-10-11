@@ -18,6 +18,18 @@ JADX_FLAG_SETS = [
 ]
 
 
+def tool_version(tool: str, *, env_var: str | None = None) -> str | None:
+    """Best-effort `<tool> --version` first line, for index provenance
+    (issue #35). Never fails: version capture must not break an init."""
+    try:
+        bin_ = find_binary(tool, env_var=env_var)
+        proc = run([bin_, "--version"], timeout=15, tool=tool, check=False)
+        out = (proc.stdout or proc.stderr or "").strip()
+        return out.splitlines()[0] if out else None
+    except Exception:
+        return None
+
+
 def apktool_decode(apk: str | Path, out_dir: str | Path,
                    timeout: int = 900) -> dict:
     bin_ = find_binary("apktool", env_var="APKDBG_APKTOOL")

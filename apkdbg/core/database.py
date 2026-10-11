@@ -17,6 +17,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+# Static-index format/provenance version, recorded as meta.index_version
+# (issue #35). Databases without the key are version 1: pre-#35 builds with
+# non-transactional in-place re-indexing. Opening a DB with a NEWER version
+# than this constant is an error; older versions are rebuilt by `init`.
+INDEX_VERSION = 2
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 
@@ -106,7 +112,8 @@ CREATE TABLE IF NOT EXISTS coverage_hits (
 
 -- investigation run manifests (issue #36): durable identity for runtime
 -- observations, stored independently of the replaceable static index
--- (init only ever rewrites the derived tables above; these are additive)
+-- (init rebuilds the derived tables above in a staged generation and
+-- carries these rows across unchanged; they are additive)
 CREATE TABLE IF NOT EXISTS runs (
   run_id            TEXT PRIMARY KEY,   -- durable id (uuid), stable across export/import
   manifest_version  INTEGER NOT NULL,
@@ -159,11 +166,27 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
 
 
 class MappingDB:
+    """SQLite handle over the mapping schema.
+
+    Context-manager protocol is transaction-safe (issue #35): exiting the
+    `with` block commits only when no exception occurred; on exception the
+    pending transaction is rolled back, so a failed parser/insertion never
+    persists a partially rebuilt index.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        fresh = not self.path.exists()
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        if fresh:
+            # stamp new databases with the current index format version;
+            # pre-existing DBs keep whatever provenance they were built with
+            self.conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value)"
+                " VALUES('index_version',?)", (str(INDEX_VERSION),))
+            self.conn.commit()
 
     def execute(self, sql: str, params=()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
@@ -189,12 +212,21 @@ class MappingDB:
     def commit(self) -> None:
         self.conn.commit()
 
+    def rollback(self) -> None:
+        self.conn.rollback()
+
     def close(self) -> None:
+        """Commit pending changes and close. Prefer the context manager:
+        `__exit__` rolls back instead of committing on exception."""
         self.conn.commit()
         self.conn.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
