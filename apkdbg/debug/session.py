@@ -282,9 +282,9 @@ class DebugSession:
                 tag = _tag_for(value, vtype)
             else:
                 raise SessionError("write_var needs name or slot")
-            if isinstance(value, str) and tag == TAG_STRING:
-                value = c.create_string(value)
-            c.frame_set_values(thread, fr["frame_id"], [(slot_n, tag, value)])
+            enc = c.create_string(value) if isinstance(value, str) \
+                and tag == TAG_STRING else value
+            c.frame_set_values(thread, fr["frame_id"], [(slot_n, tag, enc)])
             return {"slot": slot_n, "tag": tag, "written": value}
         return self._op(do)
 

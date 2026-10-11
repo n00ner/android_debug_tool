@@ -37,8 +37,9 @@ RT_SIGNATURE, RT_FIELDS, RT_METHODS, RT_GETVALUES = 1, 4, 5, 6
 CT_SUPERCLASS, CT_INVOKE = 1, 3
 # Method commands
 M_LINETABLE, M_VARTABLE = 1, 2
-# ObjectReference commands
-OR_REFTYPE, OR_GETVALUES, OR_SETVALUES, OR_INVOKE = 1, 2, 3, 9
+# ObjectReference commands (spec: InvokeMethod is cmd 6; cmd 9 is unused on
+# ART and answers with a 1-byte NOT_IMPLEMENTED-style reply)
+OR_REFTYPE, OR_GETVALUES, OR_SETVALUES, OR_INVOKE = 1, 2, 3, 6
 # StringReference
 SR_VALUE = 1
 # ThreadReference
@@ -204,7 +205,7 @@ class Writer:
         if tag in TAGS_PRIMITIVE:
             self.buf += struct.pack(TAGS_PRIMITIVE[tag], v)
         elif tag in OBJECT_TAGS:
-            self.object_id(v)
+            self.object_id(v if v is not None else 0)  # None = null ref
         elif tag == TAG_VOID:
             pass
         else:
@@ -631,7 +632,13 @@ class JdwpClient:
             w.value(tag, v)
         w.u32(options)
         r = self.request(CS_OBJECTREF, OR_INVOKE, bytes(w.buf))
-        return {"value": r.value(), "exception": r.object_id()}
+        val = r.value()
+        # spec says: exception is an untagged objectID. Android 15's
+        # JVMTI-based JDWP agent emits it as a TAGGED value ('L' + id).
+        remaining = len(r.b) - r.p
+        if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
+            r.u8()  # skip the tag byte
+        return {"value": val, "exception": r.object_id()}
 
     def ct_superclass(self, class_id: int) -> int:
         """ClassType.Superclass — returns classID of superclass, 0 for
@@ -640,6 +647,27 @@ class JdwpClient:
         w.reftype_id(class_id)
         return self.request(CS_CLASSTYPE, CT_SUPERCLASS,
                             bytes(w.buf)).reftype_id()
+
+    def ct_new_instance(self, class_id: int, thread: int, method_id: int,
+                        args: list[tuple[int, object]] | None = None,
+                        options: int = INVOKE_SINGLE_THREADED) -> dict:
+        """ClassType.NewInstance: allocate + run a constructor. Returns
+        {value: tagged new object, exception: object_id}."""
+        w = Writer(self.sizes)
+        w.reftype_id(class_id)
+        w.object_id(thread)
+        w.method_id(method_id)
+        args = args or []
+        w.u32(len(args))
+        for tag, v in args:
+            w.value(tag, v)
+        w.u32(options)
+        r = self.request(CS_CLASSTYPE, 4, bytes(w.buf))
+        val = r.value()
+        remaining = len(r.b) - r.p
+        if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
+            r.u8()
+        return {"value": val, "exception": r.object_id()}
 
     def find_method(self, class_id: int, name: str,
                     sig: str | None = None) -> tuple[int, int]:

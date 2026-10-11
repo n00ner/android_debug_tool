@@ -63,7 +63,7 @@ CRYPTO_HOOKS: list[dict] = [
      "sig": "([B)V",
      "capture": [{"slot": 1, "type": "byte[]", "label": "iv"}], "meta": []},
     {"name": "Mac.doFinal(byte[])",
-     "cls": "Ljavax/crypto/Mac;", "method": "doFinal", "sig": "([B)V",
+     "cls": "Ljavax/crypto/Mac;", "method": "doFinal", "sig": "([B)[B",
      "capture": [{"slot": 1, "type": "byte[]", "label": "input"}],
      "meta": [GET_ALGO]},
     {"name": "MessageDigest.digest(byte[])",
