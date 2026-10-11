@@ -105,10 +105,20 @@ class Adb:
     # -- transport ----------------------------------------------------------
     def forward_jdwp(self, pid: int, port: int | None = None) -> int:
         """Forward a local TCP port to the app's JDWP transport.
-        Uses a deterministic port derived from the pid so reconnects are
-        idempotent."""
-        port = port or (8700 + pid % 900)
-        self.sh("forward", f"tcp:{port}", f"jdwp:{pid}")
+
+        Without an explicit port, let the adb server allocate a free one
+        (tcp:0) — adb listeners live in the shared host server keyed by
+        local name, so a deterministic pid-derived port collides across
+        processes (pid % 900) and across devices. With an explicit port,
+        --no-rebind refuses to retarget an existing listener instead of
+        silently stealing another session's mapping."""
+        if port is None:
+            out = self.sh("forward", "tcp:0", f"jdwp:{pid}")
+            m = re.search(r"(\d+)", out)
+            if not m:
+                raise AdbError(f"adb reported no allocated port: {out!r}")
+            return int(m.group(1))
+        self.sh("forward", "--no-rebind", f"tcp:{port}", f"jdwp:{pid}")
         return port
 
     def remove_forward(self, port: int) -> None:

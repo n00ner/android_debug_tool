@@ -86,6 +86,8 @@ class DebugSession:
                 raise SessionError(
                     f"target process died (pid {self.pid} -> {pid})",
                     hint="re-run connect; breakpoints must be re-registered")
+            # release our own listener first: forward_jdwp uses --no-rebind
+            self.adb.remove_forward(self.port)
             self.adb.forward_jdwp(self.pid, self.port)
             self._attach()
             return fn(self.client, *args, **kwargs)
