@@ -163,24 +163,27 @@ def invoke_meta(c: JdwpClient, thread: int, obj: int,
                 invokes: list[dict]) -> dict:
     """Run metadata invokes on `this` (e.g. Cipher.getAlgorithm) while the
     thread is suspended. Each: {"method": "getAlgorithm",
-    "sig": "()Ljava/lang/String;", "label": "algorithm"}."""
+    "sig": "()Ljava/lang/String;", "label": "algorithm"}.
+    Resolution is the checked path (issue #22): the method is resolved to
+    its DECLARING class and invoked with that class ID — pairing a
+    subclass type ID with an inherited method ID killed the JDWP
+    connection on Android 15."""
     out = {}
     if not obj:
         return out
     try:
         _, type_id = c.object_reftype(obj)
-        methods = c.rt_methods(type_id)
     except Exception:
         return out
     for inv in invokes:
-        m = next((m for m in methods
-                  if m["name"] == inv["method"] and m["sig"] == inv["sig"]),
-                 None)
-        if not m:
-            out[inv["label"]] = {"error": "method not found"}
+        try:
+            def_cls, method_id = c.resolve_instance_method(
+                type_id, inv["method"], inv["sig"])
+        except Exception as e:
+            out[inv["label"]] = {"error": str(e)[:120]}
             continue
         try:
-            r = c.invoke_object_method(obj, thread, type_id, m["id"], [])
+            r = c.invoke_object_method(obj, thread, def_cls, method_id, [])
             val = r["value"]
             if r["exception"]:
                 out[inv["label"]] = {"error": "threw", "exc_id": r["exception"]}

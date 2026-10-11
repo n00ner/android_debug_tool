@@ -314,8 +314,8 @@ class DebugSession:
         def do(c: JdwpClient):
             _, type_id = c.object_reftype(obj)
             try:
-                def_cls, method_id = c.find_method(type_id, method,
-                                                   sig or None)
+                def_cls, method_id = c.resolve_instance_method(
+                    type_id, method, sig or None)
             except JdwpError as e:
                 raise ResolveError(str(e))
             encoded = []
