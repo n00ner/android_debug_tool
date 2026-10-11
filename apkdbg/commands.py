@@ -4,6 +4,7 @@ Each function takes a Ctx plus kwargs and returns a JSON-native dict."""
 from __future__ import annotations
 
 from .core.init_pipeline import run_init
+from .core.capabilities import collect as collect_capabilities, index_facts
 from .core.project import Project
 from .debug.conditions import ConditionalEngine
 from .debug.coverage import CoverageTracker
@@ -54,12 +55,30 @@ def cmd_init(ctx: Ctx | None, apk: str, out: str = ".", **kw) -> dict:
 
 
 # ------------------------------------------------------------------- queries
+def _index_note(db, count: int) -> dict | None:
+    """Precise explanation when a query comes back empty: distinguish 'the
+    index genuinely has no such rows' from 'the index is incomplete'."""
+    if count:
+        return None
+    facts = index_facts(db)
+    note = {"table_empty": True, "index_complete": facts["complete"],
+            "line_map": facts["line_map"],
+            "hint": "run 'capabilities' for the full index/capability report"}
+    if facts["warnings"]:
+        note["warnings"] = facts["warnings"][:5]
+    return note
+
+
 def cmd_classes(ctx: Ctx, filter: str = "", limit: int = 50) -> dict:
     with ctx.project.db() as db:
         rows = db.query(
             "SELECT fqcn, deobf_fqcn, smali_path FROM classes WHERE fqcn LIKE "
             "? OR deobf_fqcn LIKE ? LIMIT ?", (f"%{filter}%",) * 2 + (limit,))
-    return {"classes": rows, "count": len(rows)}
+        note = _index_note(db, len(rows))
+    out = {"classes": rows, "count": len(rows)}
+    if note:
+        out["index_note"] = note
+    return out
 
 
 def cmd_methods(ctx: Ctx, class_: str, limit: int = 100) -> dict:
@@ -68,7 +87,11 @@ def cmd_methods(ctx: Ctx, class_: str, limit: int = 100) -> dict:
             "SELECT m.name, m.sig, m.is_native FROM methods m JOIN classes c "
             "ON c.id=m.class_id WHERE c.fqcn=? OR c.deobf_fqcn=? OR c.sig=? "
             "LIMIT ?", (class_, class_, class_, limit))
-    return {"methods": rows}
+        note = _index_note(db, len(rows))
+    out = {"methods": rows}
+    if note:
+        out["index_note"] = note
+    return out
 
 
 def cmd_res(ctx: Ctx, name: str | None = None,
@@ -76,11 +99,19 @@ def cmd_res(ctx: Ctx, name: str | None = None,
     with ctx.project.db() as db:
         if id:
             rid = int(id, 16) if id.startswith("0x") else int(id)
-            return {"resource": db.one(
-                "SELECT * FROM resources WHERE res_id=?", (rid,))}
+            row = db.one("SELECT * FROM resources WHERE res_id=?", (rid,))
+            out = {"resource": row}
+            note = _index_note(db, 1 if row else 0)
+            if note:
+                out["index_note"] = note
+            return out
         rows = db.query("SELECT * FROM resources WHERE name LIKE ? LIMIT 50",
                         (f"%{name or ''}%",))
-        return {"resources": rows}
+        note = _index_note(db, len(rows))
+    out = {"resources": rows}
+    if note:
+        out["index_note"] = note
+    return out
 
 
 def cmd_res_refs(ctx: Ctx, id: str) -> dict:  # noqa: A002
@@ -91,7 +122,20 @@ def cmd_res_refs(ctx: Ctx, id: str) -> dict:  # noqa: A002
             "m.name AS method, m.sig FROM resource_refs r JOIN methods m ON "
             "m.id=r.method_id JOIN classes c ON c.id=m.class_id "
             "WHERE r.res_id=? LIMIT 100", (rid,))
-    return {"res_id": hex(rid), "refs": rows}
+        note = _index_note(db, len(rows))
+    out = {"res_id": hex(rid), "refs": rows}
+    if note:
+        out["index_note"] = note
+    return out
+
+
+# -------------------------------------------------------------- capabilities
+def cmd_capabilities(ctx: Ctx, probe: bool = False) -> dict:
+    """Offline capability matrix for this project/APK. With probe=True, adds
+    live (transient) observations: device/process presence, JDWP attach,
+    runtime line-table availability."""
+    return collect_capabilities(ctx.project, probe_live=probe,
+                                serial=ctx.serial)
 
 
 # ------------------------------------------------------------------- session
@@ -193,6 +237,7 @@ COMMANDS = {
     "methods": cmd_methods,
     "res": cmd_res,
     "res_refs": cmd_res_refs,
+    "capabilities": cmd_capabilities,
     "connect": cmd_connect,
     "bp": cmd_bp,
     "bp_del": cmd_bp_del,

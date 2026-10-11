@@ -17,6 +17,12 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+# Mapping-DB schema/index versions, persisted in the meta table by init.
+# Bump SCHEMA_VERSION on any table/column change (future migrations key off
+# the stored value); INDEX_VERSION on index-generation logic changes.
+SCHEMA_VERSION = "2"
+INDEX_VERSION = "1"
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 

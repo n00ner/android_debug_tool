@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from pathlib import Path
 
 from ..decompile import mappings, smali_index, tools
 from ..protocol import log_progress
+from .database import INDEX_VERSION, SCHEMA_VERSION
 from .project import Project
 
 
@@ -36,105 +38,150 @@ def run_init(apk: str | Path, project_root: str | Path, *,
     pkg = mappings.parse_manifest_package(proj.manifest_path)
     if pkg:
         summary["package"] = pkg
+    debuggable = mappings.parse_manifest_debuggable(proj.manifest_path)
+    md_str = {True: "true", False: "false", None: "unknown"}[debuggable]
+    summary["manifest_debuggable"] = md_str
 
     # 2. build the mapping database --------------------------------------------
+    warnings: list[str] = []
     with proj.db() as db:
-        # resources from public.xml
-        res = mappings.parse_public_xml(
-            proj.apktool_dir / "res" / "values" / "public.xml")
-        db.executemany(
-            "INSERT OR REPLACE INTO resources(res_id,type,name) VALUES(?,?,?)",
-            [(r["res_id"], r["type"], r["name"]) for r in res])
-        summary["resources"] = len(res)
+        db.set_meta("schema_version", SCHEMA_VERSION)
+        db.set_meta("index_version", INDEX_VERSION)
+        try:
+            # resources from public.xml
+            res = mappings.parse_public_xml(
+                proj.apktool_dir / "res" / "values" / "public.xml")
+            db.executemany(
+                "INSERT OR REPLACE INTO resources(res_id,type,name) VALUES(?,?,?)",
+                [(r["res_id"], r["type"], r["name"]) for r in res])
+            summary["resources"] = len(res)
 
-        # smali index (idempotent: derived tables are rebuilt from scratch)
-        for t in ("line_map", "branch_sites", "resource_refs", "jadx_lines"):
-            db.execute(f"DELETE FROM {t}")
-        n_cls = n_meth = n_lines = n_branch = n_refs = 0
-        for smali_root, path in smali_index.iter_smali_files(proj.apktool_dir):
-            rel = f"{smali_root}/{path.relative_to(proj.apktool_dir / smali_root)}"
-            parsed = smali_index.parse_smali_file(path)
-            if not parsed["sig"]:
-                continue
-            fqcn = parsed["sig"][1:-1].replace("/", ".")
-            cur = db.execute(
-                "INSERT OR IGNORE INTO classes(sig,fqcn,smali_path,source_file)"
-                " VALUES(?,?,?,?)",
-                (parsed["sig"], fqcn, rel, parsed["source_file"]))
-            class_id = cur.lastrowid or db.one(
-                "SELECT id FROM classes WHERE sig=?", (parsed["sig"],))["id"]
-            n_cls += 1
-
-            for m in parsed["methods"]:
+            # smali index (idempotent: derived tables are rebuilt from scratch)
+            for t in ("line_map", "branch_sites", "resource_refs", "jadx_lines"):
+                db.execute(f"DELETE FROM {t}")
+            n_cls = n_meth = n_lines = n_branch = n_refs = 0
+            for smali_root, path in smali_index.iter_smali_files(proj.apktool_dir):
+                rel = f"{smali_root}/{path.relative_to(proj.apktool_dir / smali_root)}"
+                try:
+                    parsed = smali_index.parse_smali_file(path)
+                except Exception as e:  # one bad file must not abort the index
+                    warnings.append(f"smali parse failed: {rel}: {e}")
+                    continue
+                if not parsed["sig"]:
+                    continue
+                fqcn = parsed["sig"][1:-1].replace("/", ".")
                 cur = db.execute(
-                    "INSERT OR IGNORE INTO methods"
-                    "(class_id,name,sig,flags,is_native,line_start,line_end)"
-                    " VALUES(?,?,?,?,?,?,?)",
-                    (class_id, m["name"], m["sig"], m["flags"],
-                     int(m["is_native"]), m["line_start"], m["line_end"]))
-                mid = cur.lastrowid or db.one(
-                    "SELECT id FROM methods WHERE class_id=? AND name=?"
-                    " AND sig=?", (class_id, m["name"], m["sig"]))["id"]
-                n_meth += 1
+                    "INSERT OR IGNORE INTO classes(sig,fqcn,smali_path,source_file)"
+                    " VALUES(?,?,?,?)",
+                    (parsed["sig"], fqcn, rel, parsed["source_file"]))
+                class_id = cur.lastrowid or db.one(
+                    "SELECT id FROM classes WHERE sig=?", (parsed["sig"],))["id"]
+                n_cls += 1
 
-                # line map: one row per .line directive's first insn
-                seen = set()
-                for insn in m["insns"]:
-                    if insn["dl"] is not None and (insn["dl"], insn["fl"]) not in seen:
-                        seen.add((insn["dl"], insn["fl"]))
+                for m in parsed["methods"]:
+                    cur = db.execute(
+                        "INSERT OR IGNORE INTO methods"
+                        "(class_id,name,sig,flags,is_native,line_start,line_end)"
+                        " VALUES(?,?,?,?,?,?,?)",
+                        (class_id, m["name"], m["sig"], m["flags"],
+                         int(m["is_native"]), m["line_start"], m["line_end"]))
+                    mid = cur.lastrowid or db.one(
+                        "SELECT id FROM methods WHERE class_id=? AND name=?"
+                        " AND sig=?", (class_id, m["name"], m["sig"]))["id"]
+                    n_meth += 1
+
+                    # line map: one row per .line directive's first insn
+                    seen = set()
+                    for insn in m["insns"]:
+                        if insn["dl"] is not None and (insn["dl"], insn["fl"]) not in seen:
+                            seen.add((insn["dl"], insn["fl"]))
+                            db.execute(
+                                "INSERT OR IGNORE INTO line_map"
+                                "(method_id,dalvik_line,smali_line) VALUES(?,?,?)",
+                                (mid, insn["dl"], insn["fl"]))
+                            n_lines += 1
+
+                    for br in m["branches"]:
                         db.execute(
-                            "INSERT OR IGNORE INTO line_map"
-                            "(method_id,dalvik_line,smali_line) VALUES(?,?,?)",
-                            (mid, insn["dl"], insn["fl"]))
-                        n_lines += 1
+                            "INSERT INTO branch_sites(method_id,smali_line,"
+                            "dalvik_line,opcode,kind,target_smali_line,"
+                            "target_dalvik_line) VALUES(?,?,?,?,?,?,?)",
+                            (mid, br["fl"], br["dl"], br["op"], br["kind"],
+                             br["target_fl"], br["target_dl"]))
+                        n_branch += 1
 
-                for br in m["branches"]:
-                    db.execute(
-                        "INSERT INTO branch_sites(method_id,smali_line,"
-                        "dalvik_line,opcode,kind,target_smali_line,"
-                        "target_dalvik_line) VALUES(?,?,?,?,?,?,?)",
-                        (mid, br["fl"], br["dl"], br["op"], br["kind"],
-                         br["target_fl"], br["target_dl"]))
-                    n_branch += 1
+                    for rc in m["res_consts"]:
+                        db.execute(
+                            "INSERT INTO resource_refs(res_id,method_id,smali_line,"
+                            "dalvik_line,kind) VALUES(?,?,?,?,?)",
+                            (rc["res_id"], mid, rc["fl"], rc["dl"], rc["kind"]))
+                        n_refs += 1
 
-                for rc in m["res_consts"]:
-                    db.execute(
-                        "INSERT INTO resource_refs(res_id,method_id,smali_line,"
-                        "dalvik_line,kind) VALUES(?,?,?,?,?)",
-                        (rc["res_id"], mid, rc["fl"], rc["dl"], rc["kind"]))
-                    n_refs += 1
+            # jadx mappings (deobf names + optional java<->dalvik lines)
+            jm = mappings.load_jadx_mapping(
+                summary.get("jadx", {}).get("mapping_file"))
+            n_deobf = n_jlines = 0
+            for obf, deobf in jm["names"].items():
+                db.execute("UPDATE classes SET deobf_fqcn=? WHERE fqcn=?",
+                           (deobf, obf))
+                n_deobf += 1
+            for obf, line_map in jm["lines"].items():
+                row = db.one("SELECT id FROM classes WHERE fqcn=?", (obf,))
+                if row:
+                    for jl, dl in line_map.items():
+                        db.execute(
+                            "INSERT OR IGNORE INTO jadx_lines"
+                            "(class_id,java_line,dalvik_line) VALUES(?,?,?)",
+                            (row["id"], jl, dl))
+                        n_jlines += 1
+        except Exception as e:
+            # index-generation failure: record incomplete state so that
+            # capabilities reports unknown/incomplete mapping instead of
+            # misreading the partial row counts as "stripped debug info"
+            db.set_meta("index_complete", "false")
+            db.set_meta("index_warnings",
+                        json.dumps(warnings + [f"indexing aborted: {e}"]))
+            db.set_meta("line_map_state", "unknown")
+            db.set_meta("line_map_reason", "index_incomplete")
+            raise
 
-        # jadx mappings (deobf names + optional java<->dalvik lines)
-        jm = mappings.load_jadx_mapping(
-            summary.get("jadx", {}).get("mapping_file"))
-        n_deobf = n_jlines = 0
-        for obf, deobf in jm["names"].items():
-            db.execute("UPDATE classes SET deobf_fqcn=? WHERE fqcn=?",
-                       (deobf, obf))
-            n_deobf += 1
-        for obf, line_map in jm["lines"].items():
-            row = db.one("SELECT id FROM classes WHERE fqcn=?", (obf,))
-            if row:
-                for jl, dl in line_map.items():
-                    db.execute(
-                        "INSERT OR IGNORE INTO jadx_lines"
-                        "(class_id,java_line,dalvik_line) VALUES(?,?,?)",
-                        (row["id"], jl, dl))
-                    n_jlines += 1
-
+        # persistent index facts (transient device/session state never lands here)
+        lm_state, lm_reason = _line_map_state(n_cls, n_lines)
         db.set_meta("apk", str(apk))
         db.set_meta("sha256", summary["sha256"])
         if pkg:
             db.set_meta("package", pkg)
+        db.set_meta("manifest_debuggable", md_str)
+        db.set_meta("index_complete", "true")
+        db.set_meta("index_warnings", json.dumps(warnings))
+        db.set_meta("line_map_state", lm_state)
+        db.set_meta("line_map_reason", lm_reason)
+        db.set_meta("indexed_at", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        db.set_meta("tools", json.dumps(
+            {k: summary[k] for k in ("apktool", "jadx") if k in summary}))
 
     summary.update({"classes": n_cls, "methods": n_meth, "line_rows": n_lines,
                     "branch_sites": n_branch, "resource_refs": n_refs,
                     "deobf_classes": n_deobf, "jadx_line_rows": n_jlines,
+                    "index_complete": True, "warnings": warnings,
+                    "line_map": {"state": lm_state, "reason": lm_reason},
                     "elapsed_s": round(time.time() - t0, 2)})
     proj.save_state(**{k: summary[k] for k in
-                       ("apk", "sha256", "package") if k in summary})
+                       ("apk", "sha256", "package", "manifest_debuggable")
+                       if k in summary})
     log_progress(f"init complete: {n_cls} classes, {n_meth} methods")
     return summary
+
+
+def _line_map_state(n_cls: int, n_lines: int) -> tuple[str, str]:
+    """Availability AND reason, recorded separately: zero rows after a
+    completed index is NOT proof of stripped debug info by itself — it only
+    says the smali carried no .line directives."""
+    if n_lines > 0:
+        return "complete", "ok"
+    if n_cls > 0:
+        return "empty", "no_line_directives"
+    return "unknown", "no_classes_indexed"
 
 
 def _sha256(path: Path) -> str:
