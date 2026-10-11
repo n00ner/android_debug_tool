@@ -203,6 +203,12 @@ class Writer:
     def value(self, tag: int, v):
         """Encode a tagged value (tag byte included)."""
         self.u8(tag)
+        self.value_untagged(tag, v)
+
+    def value_untagged(self, tag: int, v):
+        """Encode a value without the tag byte. Used by
+        ObjectReference.SetValues and ClassType.SetValues, whose field
+        values are untagged per spec (the tag is implied by the field)."""
         if tag in TAGS_PRIMITIVE:
             self.buf += struct.pack(TAGS_PRIMITIVE[tag], v)
         elif tag in OBJECT_TAGS:
@@ -240,6 +246,13 @@ class JdwpClient:
     # -- connection ----------------------------------------------------------
     def connect(self) -> None:
         try:
+            self._connect()
+        except Exception:
+            self._abort_connect()
+            raise
+
+    def _connect(self) -> None:
+        try:
             self.sock = socket.create_connection((self.host, self.port),
                                                  timeout=self.timeout)
             self.sock.sendall(HANDSHAKE)
@@ -249,7 +262,6 @@ class JdwpClient:
                 f"JDWP connect to {self.host}:{self.port} failed: {e}",
                 hint="is the app debuggable and forwarded? (adb forward tcp:P jdwp:PID)")
         if resp != HANDSHAKE:
-            self.sock.close()
             raise JdwpConnError("JDWP handshake rejected",
                                 hint=f"got {resp!r}")
         self.sock.settimeout(None)  # reader thread blocks; requests have own timeouts
@@ -263,6 +275,25 @@ class JdwpClient:
         self.handshake_info = {"description": vr.string(),
                                "jdwp_major": vr.u32(), "jdwp_minor": vr.u32(),
                                "vm_version": vr.string(), "vm_name": vr.string()}
+
+    def _abort_connect(self) -> None:
+        """Cleanup for a failed connect(): a failed attempt must not leak
+        the socket or leave a reader thread behind (a context manager's
+        __exit__ never runs when __enter__ raises)."""
+        self._alive = False
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)  # unblock a pending recv
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        t = self._reader_t
+        if t is not None and t.is_alive():
+            t.join(timeout=2)
+        self.sock = None
 
     def close(self) -> None:
         self._alive = False
@@ -510,11 +541,18 @@ class JdwpClient:
             ev: dict = {"kind": EVENT_KIND_NAMES.get(kind, f"kind_{kind}"),
                         "kind_id": kind, "request_id": r.u32()}
             if kind in (EVK_SINGLE_STEP, EVK_BREAKPOINT, EVK_METHOD_ENTRY,
-                        EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET, EVK_EXCEPTION):
+                        EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET):
                 ev["thread"] = r.object_id()
                 ev["location"] = r.location()
                 if kind == EVK_METHOD_EXIT_RET:
                     ev["return_value"] = r.value()
+            elif kind == EVK_EXCEPTION:
+                # layout: thread, throw location, tagged exception object,
+                # catch location (zeroed when uncaught)
+                ev["thread"] = r.object_id()
+                ev["location"] = r.location()
+                ev["exception"] = r.value()
+                ev["catch_location"] = r.location()
             elif kind in (EVK_THREAD_START, EVK_THREAD_DEATH, EVK_VM_INIT):
                 ev["thread"] = r.object_id()
             elif kind == EVK_CLASS_PREPARE:
@@ -628,7 +666,8 @@ class JdwpClient:
         w.u32(len(values))
         for fid, tag, v in values:
             w.field_id(fid)
-            w.value(tag, v)
+            # spec: SetValues field values are untagged (tag implied by field)
+            w.value_untagged(tag, v)
         self.request(CS_OBJECTREF, OR_SETVALUES, bytes(w.buf))
 
     def invoke_object_method(self, obj: int, thread: int, class_id: int,
@@ -709,8 +748,8 @@ class JdwpClient:
 
     def array_get_values(self, obj: int, start: int = 0,
                          length: int = 256) -> dict:
-        """Reply: component tag u8, count u32, then elements (raw for
-        primitives, object ids otherwise)."""
+        """Reply: component tag u8, count u32, then elements (untagged for
+        primitive arrays; each reference element carries its own tag)."""
         if length == 0:
             # ART rejects zero-length GetValues with an internal error
             return {"component_tag": 66, "items": [], "inferred": True}
@@ -724,7 +763,9 @@ class JdwpClient:
         if tag in TAGS_PRIMITIVE:
             items = [r.value(tag)["v"] for _ in range(n)]
         else:
-            items = [{"tag": tag, "v": r.object_id()} for _ in range(n)]
+            # reference elements are individually tagged (runtime types may
+            # differ from the array's component tag, e.g. String in Object[])
+            items = [r.value() for _ in range(n)]
         return {"component_tag": tag, "items": items}
 
     def byte_array(self, obj: int, max_len: int = 65536) -> bytes:

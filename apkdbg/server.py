@@ -30,28 +30,33 @@ def serve_stdio(project_root: str, serial: str | None = None) -> None:
         return ctx_holder["ctx"]
 
     log_progress(f"apkdbg serving stdio, project={project_root}")
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-            rid, method = req.get("id"), req.get("method")
-            params = req.get("params") or {}
-            if method == "init":  # init needs no open project
-                result = COMMANDS["init"](None, **params)
-            else:
-                fn = COMMANDS.get(method)
-                if fn is None:
-                    raise ApkDbgError(f"unknown method {method!r}",
-                                      hint="methods: " + ", ".join(COMMANDS))
-                result = fn(get_ctx(), **params)
-            reply = {"id": rid, "result": result}
-        except Exception as e:
-            if isinstance(e, ApkDbgError):
-                payload = e.to_dict()
-            else:
-                payload = {"code": "E_INTERNAL", "message": str(e)}
-            reply = {"id": locals().get("rid"), "error": payload}
-        sys.stdout.write(dumps(reply) + "\n")
-        sys.stdout.flush()
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+                rid, method = req.get("id"), req.get("method")
+                params = req.get("params") or {}
+                if method == "init":  # init needs no open project
+                    result = COMMANDS["init"](None, **params)
+                else:
+                    fn = COMMANDS.get(method)
+                    if fn is None:
+                        raise ApkDbgError(f"unknown method {method!r}",
+                                          hint="methods: " + ", ".join(COMMANDS))
+                    result = fn(get_ctx(), **params)
+                reply = {"id": rid, "result": result}
+            except Exception as e:
+                if isinstance(e, ApkDbgError):
+                    payload = e.to_dict()
+                else:
+                    payload = {"code": "E_INTERNAL", "message": str(e)}
+                reply = {"id": locals().get("rid"), "error": payload}
+            sys.stdout.write(dumps(reply) + "\n")
+            sys.stdout.flush()
+    finally:
+        # EOF or crash: release the JDWP session AND its adb forward listener
+        if ctx_holder["ctx"] is not None:
+            ctx_holder["ctx"].close()
