@@ -515,11 +515,18 @@ class JdwpClient:
             ev: dict = {"kind": EVENT_KIND_NAMES.get(kind, f"kind_{kind}"),
                         "kind_id": kind, "request_id": r.u32()}
             if kind in (EVK_SINGLE_STEP, EVK_BREAKPOINT, EVK_METHOD_ENTRY,
-                        EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET, EVK_EXCEPTION):
+                        EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET):
                 ev["thread"] = r.object_id()
                 ev["location"] = r.location()
                 if kind == EVK_METHOD_EXIT_RET:
                     ev["return_value"] = r.value()
+            elif kind == EVK_EXCEPTION:
+                # layout: thread, throw location, tagged exception object,
+                # catch location (zeroed when uncaught)
+                ev["thread"] = r.object_id()
+                ev["location"] = r.location()
+                ev["exception"] = r.value()
+                ev["catch_location"] = r.location()
             elif kind in (EVK_THREAD_START, EVK_THREAD_DEATH, EVK_VM_INIT):
                 ev["thread"] = r.object_id()
             elif kind == EVK_CLASS_PREPARE:
