@@ -33,7 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="reuse cached apktool output (must match the APK's "
                          "recorded provenance)")
     sp.add_argument("--skip-jadx", action="store_true",
-                    help="reuse cached jadx output (same provenance rule)")
+                    help="no jadx enrichment: reuse cached jadx output when "
+                         "its provenance matches, else proceed jadx-free")
 
     sp = sub.add_parser("classes", help="search classes in mapping DB")
     sp.add_argument("--filter", default="")

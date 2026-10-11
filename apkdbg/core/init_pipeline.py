@@ -73,36 +73,45 @@ def run_init(apk: str | Path, project_root: str | Path, *,
                 f"apkdbg supports ({INDEX_VERSION})",
                 hint="upgrade apkdbg; never rebuild a newer project with an "
                      "older tool")
-    if skip_apktool or skip_jadx:
-        _check_cached_outputs(proj, prior_sha, sha,
-                              skip_apktool=skip_apktool, skip_jadx=skip_jadx)
+    jadx_reuse = (skip_jadx and prior_sha is not None
+                  and _cached_jadx_output(proj))
+    _check_reuse_gate(proj, prior_sha, sha, skip_apktool=skip_apktool,
+                      jadx_reuse=jadx_reuse)
 
     try:
         # 1. decompile into staging ------------------------------------------
         decompilers: dict = {}
         if skip_apktool:
             apktool_src = proj.apktool_dir
-            decompilers["apktool"] = {"reused": True, "version": None}
+            decompilers["apktool"] = {"reused": True, "skipped": False,
+                                      "version": None}
         else:
             summary["apktool"] = tools.apktool_decode(
                 apk, proj.apktool_staging_dir, timeout=timeout)
             apktool_src = proj.apktool_staging_dir
             decompilers["apktool"] = {
-                "reused": False,
+                "reused": False, "skipped": False,
                 "version": tools.tool_version("apktool",
                                               env_var="APKDBG_APKTOOL")}
         if skip_jadx:
-            jadx_mapping = mappings.load_jadx_mapping(
-                tools._find_mapping_file(proj.jadx_dir))
-            decompilers["jadx"] = {"reused": True, "version": None,
-                                   "flags": None}
+            if jadx_reuse:
+                jadx_mapping = mappings.load_jadx_mapping(
+                    tools._find_mapping_file(proj.jadx_dir))
+                decompilers["jadx"] = {"reused": True, "skipped": False,
+                                       "version": None, "flags": None}
+            else:
+                # jadx is optional enrichment: with no provenanced cached
+                # output, --skip-jadx simply means "proceed jadx-free"
+                jadx_mapping = mappings.load_jadx_mapping(None)
+                decompilers["jadx"] = {"skipped": True, "reused": False,
+                                       "version": None, "flags": None}
         else:
             summary["jadx"] = tools.jadx_decompile(
                 apk, proj.jadx_staging_dir, timeout=timeout)
             jadx_mapping = mappings.load_jadx_mapping(
                 summary["jadx"].get("mapping_file"))
             decompilers["jadx"] = {
-                "reused": False,
+                "reused": False, "skipped": False,
                 "version": tools.tool_version("jadx", env_var="APKDBG_JADX"),
                 "flags": summary["jadx"].get("flags")}
 
@@ -156,25 +165,46 @@ def run_init(apk: str | Path, project_root: str | Path, *,
     return summary
 
 
-def _check_cached_outputs(proj: Project, prior_sha: str | None, sha: str, *,
-                          skip_apktool: bool, skip_jadx: bool) -> None:
+def _cached_jadx_output(proj: Project) -> bool:
+    d = proj.jadx_dir
+    return d.is_dir() and any(d.iterdir())
+
+
+def _check_reuse_gate(proj: Project, prior_sha: str | None, sha: str, *,
+                      skip_apktool: bool, jadx_reuse: bool) -> None:
     """Reuse of cached decompiler outputs is only allowed when their
     provenance (the APK they were built from) matches; anything else needs
-    an explicit rebuild choice (issue #35)."""
-    if prior_sha is None:
+    an explicit rebuild choice (issue #35).
+
+    apktool is the primary index source: --skip-apktool always requires a
+    prior index with matching provenance and cached output. jadx is
+    optional enrichment: reuse of its cached output is provenance-checked
+    the same way, but --skip-jadx with nothing to reuse (e.g. first init on
+    a host without jadx) proceeds jadx-free instead of erroring."""
+    if skip_apktool:
+        if prior_sha is None:
+            raise MappingError(
+                "--skip-apktool requested but the project has no prior "
+                "index to reuse",
+                hint="run a full init first: "
+                     "apkdbg init --apk app.apk --out <dir>")
+        if prior_sha != sha:
+            raise MappingError(
+                f"cached decompiler outputs belong to APK sha256 "
+                f"{prior_sha}, not {sha}",
+                hint="explicit rebuild required: re-run init without "
+                     "--skip-apktool/--skip-jadx")
+        if not proj.manifest_path.exists():
+            raise MappingError(
+                "--skip-apktool requested but there is no cached apktool "
+                "output",
+                hint="re-run init without --skip-apktool")
+    if jadx_reuse and prior_sha != sha:
         raise MappingError(
-            "--skip-* requested but the project has no prior index to reuse",
-            hint="run a full init first: apkdbg init --apk app.apk --out <dir>")
-    if prior_sha != sha:
-        raise MappingError(
-            f"cached decompiler outputs belong to APK sha256 {prior_sha}, "
+            f"cached jadx output belongs to APK sha256 {prior_sha}, "
             f"not {sha}",
             hint="explicit rebuild required: re-run init without "
-                 "--skip-apktool/--skip-jadx")
-    if skip_apktool and not proj.manifest_path.exists():
-        raise MappingError(
-            "--skip-apktool requested but there is no cached apktool output",
-            hint="re-run init without --skip-apktool")
+                 "--skip-jadx, or use a fresh project directory")
 
 
 # ------------------------------------------------------------- staging build

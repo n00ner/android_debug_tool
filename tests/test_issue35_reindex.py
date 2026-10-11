@@ -429,6 +429,51 @@ class ProvenanceTests(ReindexTestBase):
         with self.assertRaises(MappingError) as cm:
             self.init(self.apk_a, skip_apktool=True)
         self.assertIn("no prior index", str(cm.exception))
+        with self.assertRaises(MappingError) as cm:
+            self.init(self.apk_a, skip_apktool=True, skip_jadx=True)
+        self.assertIn("no prior index", str(cm.exception))
+
+    def test_first_init_skip_jadx_proceeds_jadx_free(self):
+        # jadx is optional enrichment: on a host without jadx, a first-time
+        # init --skip-jadx must succeed with jadx-derived data simply empty
+        summary = self.init(self.apk_a, skip_jadx=True)
+        self.assertEqual(summary["generation"], 1)
+        self.assertNotIn("jadx", summary)
+        prov = json.loads(self.meta("provenance"))
+        self.assertEqual(prov["decompilers"]["jadx"],
+                         {"skipped": True, "reused": False,
+                          "version": None, "flags": None})
+        with self.proj().db() as db:
+            sigs = {c["sig"] for c in db.query("SELECT sig FROM classes")}
+            self.assertEqual(sigs, {"Lcom/foo/A;", "Lcom/foo/Removed;"})
+            self.assertEqual(db.query("SELECT * FROM jadx_lines"), [])
+            deobf = db.query("SELECT deobf_fqcn FROM classes")
+            self.assertEqual({r["deobf_fqcn"] for r in deobf}, {None})
+
+    def test_reindex_skip_jadx_without_cached_output_stays_jadx_free(self):
+        self.init(self.apk_a, skip_jadx=True)  # jadx-free first generation
+        summary = self.init(self.apk_a, skip_jadx=True)
+        self.assertEqual(summary["generation"], 2)
+        prov = json.loads(self.meta("provenance"))
+        self.assertEqual(prov["decompilers"]["jadx"],
+                         {"skipped": True, "reused": False,
+                          "version": None, "flags": None})
+        with self.proj().db() as db:
+            sigs = {c["sig"] for c in db.query("SELECT sig FROM classes")}
+            self.assertEqual(sigs, {"Lcom/foo/A;", "Lcom/foo/Removed;"})
+
+    def test_skip_jadx_with_mismatched_cached_output_errors(self):
+        self.init_a()  # full init: jadx output cached under APK A's sha
+        with self.assertRaises(MappingError) as cm:
+            self.init(self.apk_b, skip_jadx=True)
+        self.assertIn("rebuild", cm.exception.hint)
+        self.assertEqual(self.meta("index_generation"), "1")
+        # same APK reuses the cached jadx output fine
+        summary = self.init(self.apk_a, skip_jadx=True)
+        self.assertEqual(summary["generation"], 2)
+        prov = json.loads(self.meta("provenance"))
+        self.assertEqual(prov["decompilers"]["jadx"]["reused"], True)
+        self.assertEqual(prov["decompilers"]["jadx"]["skipped"], False)
 
     def test_newer_index_version_rejected(self):
         self.init_a()
