@@ -9,3 +9,7 @@ work/
 *.apk
 mapping.db
 test_scope/
+
+# generated fixture artifacts (issue #21)
+tests/fixtures/crypto/proj/
+tests/fixtures/crypto/out/
