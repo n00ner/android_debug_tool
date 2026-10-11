@@ -5,6 +5,7 @@ implement retry/reconnect policy on top."""
 from __future__ import annotations
 
 import re
+import shlex
 import time
 
 from ..errors import AdbError
@@ -61,7 +62,7 @@ class Adb:
 
     # -- app control --------------------------------------------------------
     def pidof(self, package: str) -> int | None:
-        out = self.shell(f"pidof {package}", check=False)
+        out = self.shell(f"pidof {shlex.quote(package)}", check=False)
         if out and out.isdigit():
             return int(out)
         # fallback for older devices without pidof
@@ -83,8 +84,8 @@ class Adb:
                        hint="launch the app first, or use connect --launch")
 
     def main_activity(self, package: str) -> str:
-        out = self.shell(f"cmd package resolve-activity --brief {package}",
-                         check=False)
+        out = self.shell(f"cmd package resolve-activity --brief "
+                         f"{shlex.quote(package)}", check=False)
         lines = [l for l in out.splitlines() if "/" in l]
         if lines:
             return lines[-1].strip()
@@ -93,14 +94,16 @@ class Adb:
     def launch_debug(self, package: str, activity: str | None = None) -> None:
         """Start the app suspended, waiting for a debugger (-D)."""
         activity = activity or self.main_activity(package)
-        self.shell(f"am start -D -n {activity}")
+        # quote for the remote shell: `$` is legal in nested activity
+        # class names (e.g. .Settings$NetworkDashboardActivity)
+        self.shell(f"am start -D -n {shlex.quote(activity)}")
 
     def launch(self, package: str, activity: str | None = None) -> None:
         activity = activity or self.main_activity(package)
-        self.shell(f"am start -n {activity}")
+        self.shell(f"am start -n {shlex.quote(activity)}")
 
     def force_stop(self, package: str) -> None:
-        self.shell(f"am force-stop {package}", check=False)
+        self.shell(f"am force-stop {shlex.quote(package)}", check=False)
 
     # -- transport ----------------------------------------------------------
     def forward_jdwp(self, pid: int, port: int | None = None) -> int:
