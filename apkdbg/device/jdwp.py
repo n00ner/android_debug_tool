@@ -245,6 +245,13 @@ class JdwpClient:
     # -- connection ----------------------------------------------------------
     def connect(self) -> None:
         try:
+            self._connect()
+        except Exception:
+            self._abort_connect()
+            raise
+
+    def _connect(self) -> None:
+        try:
             self.sock = socket.create_connection((self.host, self.port),
                                                  timeout=self.timeout)
             self.sock.sendall(HANDSHAKE)
@@ -254,7 +261,6 @@ class JdwpClient:
                 f"JDWP connect to {self.host}:{self.port} failed: {e}",
                 hint="is the app debuggable and forwarded? (adb forward tcp:P jdwp:PID)")
         if resp != HANDSHAKE:
-            self.sock.close()
             raise JdwpConnError("JDWP handshake rejected",
                                 hint=f"got {resp!r}")
         self.sock.settimeout(None)  # reader thread blocks; requests have own timeouts
@@ -268,6 +274,25 @@ class JdwpClient:
         self.handshake_info = {"description": vr.string(),
                                "jdwp_major": vr.u32(), "jdwp_minor": vr.u32(),
                                "vm_version": vr.string(), "vm_name": vr.string()}
+
+    def _abort_connect(self) -> None:
+        """Cleanup for a failed connect(): a failed attempt must not leak
+        the socket or leave a reader thread behind (a context manager's
+        __exit__ never runs when __enter__ raises)."""
+        self._alive = False
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)  # unblock a pending recv
+            except OSError:
+                pass
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        t = self._reader_t
+        if t is not None and t.is_alive():
+            t.join(timeout=2)
+        self.sock = None
 
     def close(self) -> None:
         self._alive = False
