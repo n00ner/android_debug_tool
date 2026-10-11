@@ -380,7 +380,7 @@ class RunWatchTests(unittest.TestCase):
         self.assertTrue(out["truncated"])
         self.assertGreaterEqual(out["captured_bytes"], 1)
 
-    def test_unrelated_events_counted_and_resumed(self):
+    def test_unrelated_events_preserved_not_resumed(self):
         c = hook_client()
         s = make_session(c)
 
@@ -398,9 +398,13 @@ class RunWatchTests(unittest.TestCase):
             out = crypto.run_watch(s, duration_s=10, names=[HOOK])
         self.assertEqual(out["unrelated"], 1)
         self.assertEqual(out["hits"], 2)
-        # one resume per thread per composite, both threads covered
-        self.assertEqual(c.resumed.count(11), 1)
-        self.assertEqual(c.resumed.count(22), 1)
+        # the owned thread is released once per composite; the unrelated
+        # stop is NOT the watch's to resume (issue #31) — it is preserved
+        # for the public wait_events caller, who owns resume responsibility
+        self.assertEqual(c.resumed, [11])
+        stashed = s.wait_events(timeout=1)
+        self.assertEqual([e["request_id"] for e in stashed["events"]],
+                         [999])
 
 
 class SessionIsolationTests(unittest.TestCase):
