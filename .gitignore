@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+# apkdbg project outputs (decompiled APKs, mapping DBs)
+work/
+*.apk
+mapping.db
