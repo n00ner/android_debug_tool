@@ -67,6 +67,9 @@ class CoverageTracker:
             kind = EVK_METHOD_ENTRY
         else:
             mods.append(c.mod_thread_only(self.thread))
+            # SINGLE_STEP requests require the Step modifier (size+depth);
+            # without it ART accepts the request but never fires it
+            mods.append(c.mod_step(self.thread, STEP_LINE, STEP_INTO))
             rid = c.set_event(EVK_SINGLE_STEP, SP_EVENT_THREAD, mods)
             kind = EVK_SINGLE_STEP
             c.thread_resume(self.thread)
