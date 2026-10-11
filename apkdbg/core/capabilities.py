@@ -309,20 +309,28 @@ def probe(project, *, serial: str | None = None, package: str | None = None,
 
 
 def _probe_line_table(client: JdwpClient, project, sample: int = 5) -> dict:
-    """Observe Method.LineTable availability for a few indexed classes."""
+    """Observe Method.LineTable availability for a few indexed classes.
+    Scans beyond the first rows (library classes are often not loaded),
+    preferring the app package, until `sample` loaded classes are found."""
+    pkg = (project.state().get("package") or "").replace(".", "/")
     with project.db() as db:
         rows = db.query(
             "SELECT c.sig FROM classes c JOIN methods m ON m.class_id=c.id "
-            "WHERE m.is_native=0 GROUP BY c.id LIMIT ?", (sample,))
+            "WHERE m.is_native=0 GROUP BY c.id "
+            "ORDER BY (c.sig LIKE ?) DESC LIMIT 200",
+            (f"L{pkg}%",))
     sampled = with_lines = 0
     for row in rows:
+        if sampled >= sample:
+            break
         try:
             classes = client.classes_by_signature(row["sig"])
             if not classes:
                 continue
             sampled += 1
             for m in client.rt_methods(classes[0]["type_id"])[:5]:
-                lt = client.method_line_table(classes[0]["type_id"], m["id"])
+                lt = client.method_line_table(classes[0]["type_id"],
+                                              m["id"])
                 if lt["lines"]:
                     with_lines += 1
                     break
