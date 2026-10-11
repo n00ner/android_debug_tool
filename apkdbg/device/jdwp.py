@@ -32,7 +32,7 @@ CS_EVENTREQUEST, CS_STACKFRAME, CS_EVENT = 15, 16, 64
 VM_VERSION, VM_CLASSES_BY_SIG, VM_ALL_THREADS, VM_IDSIZES = 1, 2, 4, 7
 VM_SUSPEND, VM_RESUME, VM_CREATE_STRING = 8, 9, 11
 # ReferenceType commands
-RT_FIELDS, RT_METHODS, RT_GETVALUES = 4, 5, 6
+RT_SIGNATURE, RT_FIELDS, RT_METHODS, RT_GETVALUES = 1, 4, 5, 6
 # ClassType commands
 CT_INVOKE = 3
 # Method commands
@@ -369,6 +369,11 @@ class JdwpClient:
         return self.request(CS_VM, VM_CREATE_STRING, bytes(w.buf)).object_id()
 
     # -- reference type / method metadata --------------------------------------
+    def rt_signature(self, type_id: int) -> str:
+        w = Writer(self.sizes)
+        w.reftype_id(type_id)
+        return self.request(CS_REFTYPE, RT_SIGNATURE, bytes(w.buf)).string()
+
     def rt_methods(self, type_id: int) -> list[dict]:
         w = Writer(self.sizes)
         w.reftype_id(type_id)
@@ -510,8 +515,7 @@ class JdwpClient:
         try:
             item = self._events.get(timeout=timeout)
         except queue.Empty:
-            raise JdwpError("event wait timed out", code="E_JDWP_TIMEOUT") \
-                if False else _timeout_error(timeout)
+            raise _timeout_error(timeout)
         if item is None:
             raise JdwpConnError(f"JDWP connection lost: {self._dead}")
         return item
