@@ -43,7 +43,7 @@ OR_REFTYPE, OR_GETVALUES, OR_SETVALUES, OR_INVOKE = 1, 2, 3, 6
 # StringReference
 SR_VALUE = 1
 # ThreadReference
-TR_NAME, TR_SUSPEND, TR_RESUME, TR_FRAMES = 1, 2, 3, 6
+TR_NAME, TR_SUSPEND, TR_RESUME, TR_FRAMES, TR_FRAMECOUNT = 1, 2, 3, 6, 7
 # ArrayReference
 AR_LENGTH, AR_GETVALUES = 1, 2
 # EventRequest
@@ -177,6 +177,7 @@ class Writer:
     def u8(self, v): self.buf.append(v & 0xFF)
     def u16(self, v): self.buf += struct.pack(">H", v)
     def u32(self, v): self.buf += struct.pack(">I", v)
+    def i32(self, v): self.buf += struct.pack(">i", v)  # signed; e.g. -1 = "all"
     def u64(self, v): self.buf += struct.pack(">Q", v)
 
     def string(self, s: str):
@@ -590,11 +591,24 @@ class JdwpClient:
         w.object_id(thread)
         self.request(CS_THREADREF, TR_RESUME, bytes(w.buf))
 
-    def thread_frames(self, thread: int, count: int = 32) -> list[dict]:
+    def thread_frame_count(self, thread: int) -> int:
         w = Writer(self.sizes)
         w.object_id(thread)
-        w.u32(0)
-        w.u32(count)
+        return self.request(CS_THREADREF, TR_FRAMECOUNT, bytes(w.buf)).u32()
+
+    def thread_frames(self, thread: int, count: int = 32) -> list[dict]:
+        """Up to `count` frames from the top of the stack. count=-1 (or a
+        count beyond the stack depth) is valid per spec; a positive count
+        is clamped to the actual depth so shallow stacks don't fail with
+        INVALID_LENGTH. Start/length are SIGNED ints on the wire."""
+        if count < 0:
+            length = -1
+        else:
+            length = min(count, self.thread_frame_count(thread))
+        w = Writer(self.sizes)
+        w.object_id(thread)
+        w.i32(0)
+        w.i32(length)
         r = self.request(CS_THREADREF, TR_FRAMES, bytes(w.buf))
         return [{"frame_id": r.frame_id(), "location": r.location()}
                 for _ in range(r.u32())]
