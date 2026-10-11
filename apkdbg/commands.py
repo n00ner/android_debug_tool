@@ -18,6 +18,22 @@ from .debug.snapshot import Budgets, Snapshotter
 from .errors import SessionError
 
 
+# ------------------------------------------------------------- pagination
+MAX_PAGE = 500  # hard upper bound for any list command's page size
+
+
+def _page(limit: int, offset: int) -> tuple[int, int]:
+    """Clamp client-supplied pagination to bounded, deterministic values.
+    The applied (clamped) values are echoed back in the reply metadata."""
+    return max(1, min(int(limit), MAX_PAGE)), max(0, int(offset))
+
+
+def _page_meta(rows: list, total: int, limit: int, offset: int) -> dict:
+    """Truncation metadata, same shape as `runs list` (issue #36)."""
+    return {"count": len(rows), "total": total, "limit": limit,
+            "offset": offset, "truncated": offset + len(rows) < total}
+
+
 class Ctx:
     """Holds the project handle and (lazily) the live debug session.
     The JSON-RPC server keeps one Ctx alive; the CLI builds one per call."""
@@ -52,51 +68,73 @@ class Ctx:
 
 
 # --------------------------------------------------------------------- init
-def cmd_init(ctx: Ctx | None, apk: str, out: str = ".", **kw) -> dict:
-    return run_init(apk, out,
-                    skip_apktool=kw.get("skip_apktool", False),
-                    skip_jadx=kw.get("skip_jadx", False))
+def cmd_init(ctx: Ctx | None, apk: str, out: str = ".",
+             skip_apktool: bool = False, skip_jadx: bool = False) -> dict:
+    return run_init(apk, out, skip_apktool=skip_apktool, skip_jadx=skip_jadx)
 
 
 # ------------------------------------------------------------------- queries
-def cmd_classes(ctx: Ctx, filter: str = "", limit: int = 50) -> dict:
+def cmd_classes(ctx: Ctx, filter: str = "", limit: int = 50,
+                offset: int = 0) -> dict:
+    limit, offset = _page(limit, offset)
+    args = (f"%{filter}%",) * 2
+    where = "WHERE fqcn LIKE ? OR deobf_fqcn LIKE ?"
     with ctx.project.db() as db:
         rows = db.query(
-            "SELECT fqcn, deobf_fqcn, smali_path FROM classes WHERE fqcn LIKE "
-            "? OR deobf_fqcn LIKE ? LIMIT ?", (f"%{filter}%",) * 2 + (limit,))
-    return {"classes": rows, "count": len(rows)}
+            "SELECT fqcn, deobf_fqcn, smali_path FROM classes " + where +
+            " LIMIT ? OFFSET ?", args + (limit, offset))
+        total = db.one("SELECT COUNT(*) AS n FROM classes " + where,
+                       args)["n"]
+    return {"classes": rows, **_page_meta(rows, total, limit, offset)}
 
 
-def cmd_methods(ctx: Ctx, class_: str, limit: int = 100) -> dict:
+def cmd_methods(ctx: Ctx, class_: str, limit: int = 100,
+                offset: int = 0) -> dict:
+    limit, offset = _page(limit, offset)
+    args = (class_, class_, class_)
+    where = ("WHERE c.fqcn=? OR c.deobf_fqcn=? OR c.sig=?")
     with ctx.project.db() as db:
         rows = db.query(
             "SELECT m.name, m.sig, m.is_native FROM methods m JOIN classes c "
-            "ON c.id=m.class_id WHERE c.fqcn=? OR c.deobf_fqcn=? OR c.sig=? "
-            "LIMIT ?", (class_, class_, class_, limit))
-    return {"methods": rows}
+            "ON c.id=m.class_id " + where + " LIMIT ? OFFSET ?",
+            args + (limit, offset))
+        total = db.one(
+            "SELECT COUNT(*) AS n FROM methods m JOIN classes c ON "
+            "c.id=m.class_id " + where, args)["n"]
+    return {"methods": rows, **_page_meta(rows, total, limit, offset)}
 
 
 def cmd_res(ctx: Ctx, name: str | None = None,
-            id: str | None = None) -> dict:  # noqa: A002 - CLI-facing name
+            id: str | None = None,  # noqa: A002 - CLI-facing name
+            limit: int = 50, offset: int = 0) -> dict:
     with ctx.project.db() as db:
         if id:
             rid = int(id, 16) if id.startswith("0x") else int(id)
             return {"resource": db.one(
                 "SELECT * FROM resources WHERE res_id=?", (rid,))}
-        rows = db.query("SELECT * FROM resources WHERE name LIKE ? LIMIT 50",
-                        (f"%{name or ''}%",))
-        return {"resources": rows}
+        limit, offset = _page(limit, offset)
+        rows = db.query(
+            "SELECT * FROM resources WHERE name LIKE ? LIMIT ? OFFSET ?",
+            (f"%{name or ''}%", limit, offset))
+        total = db.one("SELECT COUNT(*) AS n FROM resources "
+                       "WHERE name LIKE ?", (f"%{name or ''}%",))["n"]
+    return {"resources": rows, **_page_meta(rows, total, limit, offset)}
 
 
-def cmd_res_refs(ctx: Ctx, id: str) -> dict:  # noqa: A002
+def cmd_res_refs(ctx: Ctx, id: str,  # noqa: A002
+                 limit: int = 100, offset: int = 0) -> dict:
     rid = int(id, 16) if id.startswith("0x") else int(id)
+    limit, offset = _page(limit, offset)
     with ctx.project.db() as db:
         rows = db.query(
             "SELECT r.res_id, r.kind, r.dalvik_line, r.smali_line, c.fqcn, "
             "m.name AS method, m.sig FROM resource_refs r JOIN methods m ON "
             "m.id=r.method_id JOIN classes c ON c.id=m.class_id "
-            "WHERE r.res_id=? LIMIT 100", (rid,))
-    return {"res_id": hex(rid), "refs": rows}
+            "WHERE r.res_id=? LIMIT ? OFFSET ?", (rid, limit, offset))
+        total = db.one("SELECT COUNT(*) AS n FROM resource_refs r "
+                       "WHERE r.res_id=?", (rid,))["n"]
+    return {"res_id": hex(rid), "refs": rows,
+            **_page_meta(rows, total, limit, offset)}
 
 
 # ------------------------------------------------------------------- session
@@ -115,8 +153,11 @@ def cmd_bp_del(ctx: Ctx, request_id: int) -> dict:
     return ctx.session.delete_breakpoint(request_id)
 
 
-def cmd_bp_list(ctx: Ctx) -> dict:
-    return {"breakpoints": ctx.session.list_breakpoints()}
+def cmd_bp_list(ctx: Ctx, limit: int = 50, offset: int = 0) -> dict:
+    limit, offset = _page(limit, offset)
+    bps = ctx.session.list_breakpoints()
+    page = bps[offset:offset + limit]
+    return {"breakpoints": page, **_page_meta(page, len(bps), limit, offset)}
 
 
 def cmd_events(ctx: Ctx, timeout: float = 60.0) -> dict:
@@ -230,6 +271,7 @@ def cmd_runs(ctx: Ctx, action: str = "list", run_id: str | None = None,
     run/event/artifact relationship."""
     store = RunStore(ctx.project)
     if action == "list":
+        limit, offset = _page(limit, offset)
         return store.list_runs(limit=limit, offset=offset, kind=kind)
     if action == "get":
         if not run_id:
@@ -260,14 +302,19 @@ def cmd_snapshot_diff(ctx: Ctx, a: str, b: str, force: bool = False) -> dict:
     return snapshot_diff(RunStore(ctx.project), a, b, force=force)
 
 
-def cmd_native(ctx: Ctx) -> dict:
+def cmd_native(ctx: Ctx, limit: int = 200, offset: int = 0) -> dict:
     """Dual-hex debugging scaffold: report native methods registered in the
     mapping DB and the lldb-server orchestration status (see device/lldb)."""
+    limit, offset = _page(limit, offset)
     with ctx.project.db() as db:
         rows = db.query(
             "SELECT c.fqcn, m.name, m.sig FROM methods m JOIN classes c ON "
-            "c.id=m.class_id WHERE m.is_native=1 LIMIT 200")
-    return {"native_methods": rows, "count": len(rows),
+            "c.id=m.class_id WHERE m.is_native=1 LIMIT ? OFFSET ?",
+            (limit, offset))
+        total = db.one("SELECT COUNT(*) AS n FROM methods m "
+                       "WHERE m.is_native=1")["n"]
+    return {"native_methods": rows,
+            **_page_meta(rows, total, limit, offset),
             "lldb": "not_implemented",
             "plan": "push lldb-server, `lldb-server platform --listen`, "
                     "suspend VM via JDWP before native attach to avoid races"}

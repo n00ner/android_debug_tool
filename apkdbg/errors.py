@@ -1,10 +1,17 @@
 """Structured error hierarchy. Every error carries a stable machine-readable
-code so LLM agents can branch on `code` instead of parsing messages."""
+code so LLM agents can branch on `code` instead of parsing messages.
+
+`to_dict()` shape is the stable error-data contract (also embedded in
+JSON-RPC 2.0 error.data, see server.py): `code`, `message`, `retryable`,
+and `outcome` are always present; `hint` and `context` appear only when
+set (absent means none, never null)."""
 
 
 class ApkDbgError(Exception):
     code = "E_INTERNAL"
     hint: str | None = None
+    retryable = False          # safe to retry the same call as-is
+    outcome = "failed"         # failed = no effect; partial = some effects
 
     def __init__(self, message: str, *, hint: str | None = None, **context):
         super().__init__(message)
@@ -14,7 +21,8 @@ class ApkDbgError(Exception):
         self.context = context
 
     def to_dict(self) -> dict:
-        d = {"code": self.code, "message": self.message}
+        d = {"code": self.code, "message": self.message,
+             "retryable": self.retryable, "outcome": self.outcome}
         if self.hint:
             d["hint"] = self.hint
         if self.context:
@@ -40,10 +48,12 @@ class MappingError(ApkDbgError):
 
 class AdbError(ApkDbgError):
     code = "E_ADB"
+    retryable = True  # adb transport failures are transient (recovery ladder)
 
 
 class JdwpError(ApkDbgError):
     code = "E_JDWP"
+    retryable = True  # connection drops are reconnectable
 
 
 class JdwpReplyError(JdwpError):
@@ -89,3 +99,22 @@ class ResolveError(ApkDbgError):
 
 class CapabilityError(ApkDbgError):
     code = "E_CAPABILITY"
+
+
+# ------------------------------------------------------- protocol (issue #33)
+class ProtocolError(ApkDbgError):
+    """Malformed or unsatisfiable request envelope — deterministic, raised
+    before any project/session context is obtained."""
+    code = "E_PROTOCOL"
+
+
+class InvalidRequestError(ProtocolError):
+    code = "E_INVALID_REQUEST"
+
+
+class MethodNotFoundError(ProtocolError):
+    code = "E_METHOD_NOT_FOUND"
+
+
+class InvalidParamsError(ProtocolError):
+    code = "E_INVALID_PARAMS"
