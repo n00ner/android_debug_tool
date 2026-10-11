@@ -45,7 +45,9 @@ Key design decisions:
   policy EVENT_THREAD (other threads keep running).
 - **Context-window discipline.** One minified JSON line per reply; all dumps
   are budget-capped (depth/fields/items/string/total-nodes) with explicit
-  `"trunc": true` markers; progress chatter goes to stderr only.
+  `"trunc": true` markers; progress chatter goes to stderr only. Replies are
+  strict JSON (RFC 8259): non-finite JDWP float/double values are emitted as
+  the string markers `"NaN"`, `"Infinity"`, `"-Infinity"`.
 
 ## Mapping database schema (`mapping.db`)
 
