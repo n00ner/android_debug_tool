@@ -11,6 +11,10 @@ Node shapes:
   other array      ->  {"arr": [...], "len": n, "trunc": true?}
   object           ->  {"cls": "Lcom/x/Foo;", "id": 123, "f": {"name": node}}
   cycle            ->  {"$ref": 123}
+
+The "id"/"$ref" values are per-connection runtime ids: they are meaningful
+only within the capturing session's epoch and are never a durable identity
+(see debug/snapdiff.py, which compares snapshots without them).
 """
 
 from __future__ import annotations
@@ -27,6 +31,39 @@ class Budgets:
         self.max_depth, self.max_fields = max_depth, max_fields
         self.max_items, self.max_str = max_items, max_str
         self.max_bytes, self.max_nodes = max_bytes, max_nodes
+
+    def as_dict(self) -> dict:
+        return {"max_depth": self.max_depth, "max_fields": self.max_fields,
+                "max_items": self.max_items, "max_str": self.max_str,
+                "max_bytes": self.max_bytes, "max_nodes": self.max_nodes}
+
+
+def truncation_report(node) -> dict:
+    """Summarize the completeness of a captured snapshot: truncated values,
+    budget-limited subtrees, and capture errors. `complete` is False when
+    any part of the graph went unobserved — such snapshots must not be
+    treated as full observations by diffs (see debug/snapdiff.py)."""
+    rep: dict = {"truncated_values": 0, "budget_limited": 0, "errors": []}
+
+    def walk(n):
+        if isinstance(n, dict):
+            if n.get("trunc"):
+                rep["truncated_values"] += 1
+            if "..." in n:
+                rep["budget_limited"] += 1
+            for k in ("error", "fields_error", "locals_error"):
+                if isinstance(n.get(k), str) and len(rep["errors"]) < 20:
+                    rep["errors"].append(n[k][:80])
+            for v in n.values():
+                walk(v)
+        elif isinstance(n, list):
+            for v in n:
+                walk(v)
+
+    walk(node)
+    rep["complete"] = not (rep["truncated_values"] or rep["budget_limited"]
+                           or rep["errors"])
+    return rep
 
 
 class Snapshotter:
@@ -70,6 +107,14 @@ class Snapshotter:
 
     def dump_object(self, obj: int, depth: int = 0) -> dict:
         return self._node(TAG_OBJECT, obj, depth)
+
+    def persist(self, store, run_id: str, data: dict, *,
+                epoch: int | None = None) -> str:
+        """Persist a captured snapshot as an artifact of `run_id`, with the
+        capture budgets and a truncation/completeness summary (issue #36)."""
+        return store.add_artifact(
+            run_id, "snapshot", data, budgets=self.b.as_dict(),
+            truncation=truncation_report(data), epoch=epoch)
 
     # ----------------------------------------------------------------- engine
     def _node(self, tag: int, v, depth: int):

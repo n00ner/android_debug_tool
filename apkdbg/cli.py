@@ -101,11 +101,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("snapshot")
     sp.add_argument("--thread", type=int, required=True)
     sp.add_argument("--depth", type=int, default=3)
+    sp.add_argument("--record", action="store_true",
+                    help="persist as an artifact under a run manifest")
+    sp.add_argument("--run-id", help="attach to an existing run")
+    sp.add_argument("--scenario")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("dump_object")
     sp.add_argument("--obj", type=int, required=True)
     sp.add_argument("--depth", type=int, default=3)
+    sp.add_argument("--record", action="store_true",
+                    help="persist as an artifact under a run manifest")
+    sp.add_argument("--run-id", help="attach to an existing run")
+    sp.add_argument("--scenario")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("cond", help="conditional breakpoint")
@@ -125,6 +133,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--defer", action="store_true",
                     help="CLASS_PREPARE-watch pending hooks and auto-install "
                          "when their class loads")
+    sp.add_argument("--record", action="store_true",
+                    help="persist the watch as a run manifest with one "
+                         "event row per captured record")
+    sp.add_argument("--scenario")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("coverage", help="branch/method coverage")
@@ -133,7 +145,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--thread", type=int)
     sp.add_argument("--budget", type=int, default=20000)
     sp.add_argument("--seconds", type=int, default=60)
+    sp.add_argument("--scenario")
     sp.add_argument("--pkg")
+
+    sp = sub.add_parser("runs", help="investigation run manifests")
+    sp.add_argument("action", choices=["list", "get", "export", "import"])
+    sp.add_argument("run_id", nargs="?")
+    sp.add_argument("--file", help="export destination / import source")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+    sp.add_argument("--kind")
+    sp.add_argument("--replace", action="store_true",
+                    help="import: overwrite an existing run_id")
+
+    sp = sub.add_parser("snapshot_diff",
+                        help="structural diff of two snapshot artifacts")
+    sp.add_argument("a", help="artifact id (or run id with one snapshot)")
+    sp.add_argument("b", help="artifact id (or run id with one snapshot)")
+    sp.add_argument("--force", action="store_true",
+                    help="compare despite incompatibilities (qualifications "
+                         "are kept in the output)")
 
     sub.add_parser("native", help="list native methods + lldb plan")
 

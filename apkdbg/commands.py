@@ -3,12 +3,17 @@ Each function takes a Ctx plus kwargs and returns a JSON-native dict."""
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from .core.init_pipeline import run_init
+from .core.manifests import RunStore, capture_environment
 from .core.project import Project
 from .debug.conditions import ConditionalEngine
 from .debug.coverage import CoverageTracker
 from .debug.hooks import crypto as crypto_hooks
 from .debug.session import DebugSession
+from .debug.snapdiff import snapshot_diff
 from .debug.snapshot import Budgets, Snapshotter
 from .errors import SessionError
 
@@ -144,14 +149,47 @@ def cmd_resume(ctx: Ctx, thread: int | None = None) -> dict:
     return ctx.session.resume(thread)
 
 
-def cmd_snapshot(ctx: Ctx, thread: int, depth: int = 3) -> dict:
+def cmd_snapshot(ctx: Ctx, thread: int, depth: int = 3,
+                 record: bool = False, run_id: str | None = None,
+                 scenario: str | None = None) -> dict:
     s = Snapshotter(ctx.session.client, Budgets(max_depth=depth))
-    return s.snapshot_frame(thread)
+    data = s.snapshot_frame(thread)
+    if record:
+        _persist_snapshot(ctx, s, data, run_id, scenario,
+                          scope={"type": "frame", "frame": data.get("frame"),
+                                 "class": data.get("class")})
+    return data
 
 
-def cmd_dump_object(ctx: Ctx, obj: int, depth: int = 3) -> dict:
+def cmd_dump_object(ctx: Ctx, obj: int, depth: int = 3,
+                    record: bool = False, run_id: str | None = None,
+                    scenario: str | None = None) -> dict:
     s = Snapshotter(ctx.session.client, Budgets(max_depth=depth))
-    return s.dump_object(obj)
+    data = s.dump_object(obj)
+    if record:
+        _persist_snapshot(ctx, s, data, run_id, scenario,
+                          scope={"type": "object",
+                                 "class": data.get("cls")})
+    return data
+
+
+def _persist_snapshot(ctx: Ctx, s: Snapshotter, data: dict,
+                      run_id: str | None, scenario: str | None,
+                      scope: dict) -> None:
+    """Persist a snapshot as an artifact (issue #36): under the given run,
+    or under a new single-capture run. Adds run_id/artifact_id keys."""
+    store = RunStore(ctx.project)
+    epoch = ctx.session.events.epoch
+    own_run = run_id is None
+    if own_run:
+        run_id = store.begin_run(
+            "snapshot", capture_config={"scope": scope, **s.b.as_dict()},
+            scenario=scenario, epoch=epoch,
+            environment=capture_environment(ctx.session))
+    data["artifact_id"] = s.persist(store, run_id, data, epoch=epoch)
+    data["run_id"] = run_id
+    if own_run:
+        store.end_run(run_id, "completed")
 
 
 def cmd_cond(ctx: Ctx, spec: str, pred: dict, capture: list[dict],
@@ -165,18 +203,61 @@ def cmd_hook_crypto(ctx: Ctx, duration: float = 60.0,
                     returns: bool = False,
                     max_events: int = 1000,
                     max_bytes: int = 1 << 20,
-                    defer: bool = False) -> dict:
+                    defer: bool = False,
+                    record: bool = False,
+                    scenario: str | None = None) -> dict:
     return crypto_hooks.run_watch(ctx.session, duration_s=duration,
                                   names=hooks, capture_returns=returns,
                                   max_events=max_events,
-                                  max_bytes=max_bytes, defer=defer)
+                                  max_bytes=max_bytes, defer=defer,
+                                  record=record, scenario=scenario)
 
 
 def cmd_coverage(ctx: Ctx, packages: list[str], mode: str = "method",
                  thread: int | None = None, budget: int = 20000,
-                 seconds: int = 60) -> dict:
+                 seconds: int = 60, scenario: str | None = None) -> dict:
     return CoverageTracker(ctx.session, packages, mode=mode, thread=thread,
-                           budget=budget, seconds=seconds).run()
+                           budget=budget, seconds=seconds,
+                           scenario=scenario).run()
+
+
+# ---------------------------------------------------------- runs (issue #36)
+def cmd_runs(ctx: Ctx, action: str = "list", run_id: str | None = None,
+             file: str | None = None, limit: int = 50, offset: int = 0,
+             kind: str | None = None, replace: bool = False) -> dict:
+    """Run manifests: list (bounded pagination) | get | export | import.
+    Export/import preserve the manifest schema version and every
+    run/event/artifact relationship."""
+    store = RunStore(ctx.project)
+    if action == "list":
+        return store.list_runs(limit=limit, offset=offset, kind=kind)
+    if action == "get":
+        if not run_id:
+            raise SessionError("runs get needs a run_id")
+        return store.get_run(run_id)
+    if action == "export":
+        if not run_id:
+            raise SessionError("runs export needs a run_id")
+        data = store.export_run(run_id)
+        if file:
+            Path(file).write_text(
+                json.dumps(data, indent=1, ensure_ascii=False), "utf-8")
+        return {"run_id": run_id, "file": file, "manifest": data}
+    if action == "import":
+        if not file:
+            raise SessionError("runs import needs --file",
+                               hint="path of a `runs export` JSON file")
+        data = json.loads(Path(file).read_text("utf-8"))
+        return store.import_run(data, replace=replace)
+    raise SessionError(f"unknown runs action {action!r}",
+                       hint="list | get | export | import")
+
+
+def cmd_snapshot_diff(ctx: Ctx, a: str, b: str, force: bool = False) -> dict:
+    """Structural diff of two persisted snapshot artifacts (ids, or run ids
+    with exactly one snapshot artifact). Compatibility is checked first;
+    incompatible captures return explicit reasons unless forced."""
+    return snapshot_diff(RunStore(ctx.project), a, b, force=force)
 
 
 def cmd_native(ctx: Ctx) -> dict:
@@ -213,5 +294,7 @@ COMMANDS = {
     "cond": cmd_cond,
     "hook_crypto": cmd_hook_crypto,
     "coverage": cmd_coverage,
+    "runs": cmd_runs,
+    "snapshot_diff": cmd_snapshot_diff,
     "native": cmd_native,
 }
