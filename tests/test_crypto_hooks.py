@@ -6,6 +6,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from apkdbg.debug.capture import arg_vreg_map
 from apkdbg.debug.hooks import crypto
 from apkdbg.debug.session import DebugSession
 from apkdbg.device.jdwp import (
@@ -35,6 +36,7 @@ class FakeJdwpClient:
         self.event_queue = []    # composites returned by next_event
         self.cleared = []        # (kind, request_id)
         self.resumed = []        # thread ids
+        self.var_tables = {}     # (type_id, method_id) -> vartable
         self.fail_set_event = False
         self.fail_thread_frames = False
 
@@ -57,6 +59,12 @@ class FakeJdwpClient:
 
     def method_line_table(self, type_id, method_id):
         return {"lines": [{"index": 0, "line": 1}]}
+
+    def method_var_table(self, type_id, method_id):
+        vt = self.var_tables.get((type_id, method_id))
+        if vt is None:
+            raise JdwpError("ABSENT_INFORMATION")
+        return vt
 
     def set_breakpoint(self, class_id, method_id, index, suspend_policy=2):
         return self._rid()
@@ -403,6 +411,64 @@ class SessionIsolationTests(unittest.TestCase):
             s._attach()
         self.assertEqual(s.bp_registry, {})
         self.assertEqual(s._sig_cache, {})
+
+
+class VregMapTests(unittest.TestCase):
+    """ART's JDWP GetValues expects raw DEX vregs, not JVM arg slots
+    (Android 15: INVALID_SLOT/TYPE_MISMATCH otherwise). arg_vreg_map
+    translates via the LocalVariableTable at install time."""
+
+    VARTABLE = {"arg_cnt": 3, "slots": [
+        {"code_index": 0, "name": "this",
+         "sig": "Ljavax/crypto/spec/SecretKeySpec;", "length": 37,
+         "slot": 2},
+        {"code_index": 0, "name": "key", "sig": "[B", "length": 37,
+         "slot": 3},
+        {"code_index": 0, "name": "algorithm",
+         "sig": "Ljava/lang/String;", "length": 37, "slot": 4}]}
+
+    def test_arg_vreg_map_params_in_high_registers(self):
+        c = hook_client()
+        c.var_tables[(1000, 1500)] = self.VARTABLE
+        self.assertEqual(arg_vreg_map(c, 1000, 1500),
+                         {0: 2, 1: 3, 2: 4})
+
+    def test_arg_vreg_map_wide_args(self):
+        c = hook_client()
+        c.var_tables[(1000, 1500)] = {"arg_cnt": 5, "slots": [
+            {"code_index": 0, "name": "this", "sig": "LX;", "length": 9,
+             "slot": 3},
+            {"code_index": 0, "name": "a", "sig": "J", "length": 9,
+             "slot": 4},
+            {"code_index": 0, "name": "b", "sig": "I", "length": 9,
+             "slot": 6},
+            {"code_index": 2, "name": "tmp", "sig": "I", "length": 3,
+             "slot": 0}]}
+        # arg_cnt counts words: this(1) + long(2) + int(1) = 4... use 4
+        c.var_tables[(1000, 1500)]["arg_cnt"] = 4
+        self.assertEqual(arg_vreg_map(c, 1000, 1500), {0: 3, 1: 4, 3: 6})
+
+    def test_arg_vreg_map_absent_table_returns_none(self):
+        c = hook_client()  # no var table -> JdwpError -> None
+        self.assertIsNone(arg_vreg_map(c, 1000, 1500))
+
+    def test_entry_capture_uses_dex_vregs(self):
+        c = hook_client()
+        c.methods[1000] = [{"name": "doFinal", "sig": "([B)[B", "id": 1500}]
+        c.var_tables[(1000, 1500)] = {"arg_cnt": 2, "slots": [
+            {"code_index": 0, "name": "this",
+             "sig": "Ljavax/crypto/Cipher;", "length": 9, "slot": 4},
+            {"code_index": 0, "name": "input", "sig": "[B", "length": 9,
+             "slot": 5}]}
+        c.frames[11] = [{"frame_id": 1, "location": {}}]
+        c.slot_values[(1, 5)] = 9001  # keyed by DEX vreg, not JVM slot 1
+        c.arrays[9001] = b"plaintext"
+        s = make_session(c)
+        rep = crypto.install(s, names=["Cipher.doFinal(byte[])"])
+        rid = rep["installed"][0]["request_ids"][0]
+        self.assertEqual(s.bp_registry[rid]["vregs"], {0: 4, 1: 5})
+        rec = crypto.extract_event(s, bp_event(rid))
+        self.assertEqual(rec["args"]["input"]["utf8"], "plaintext")
 
 
 if __name__ == "__main__":

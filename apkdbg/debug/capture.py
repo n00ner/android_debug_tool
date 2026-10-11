@@ -49,14 +49,49 @@ def capture_value(c: JdwpClient, thread: int, frame_id: int, slot: int,
                            list(PRIM_TYPES) + ["string", "byte[]", "object"]))
 
 
+def arg_vreg_map(c: JdwpClient, type_id: int,
+                 method_id: int) -> dict[int, int] | None:
+    """Map JVM-style argument slots (0 = this for instance methods, then
+    args in declaration order, long/double taking two slots) to ART DEX
+    vreg numbers via the LocalVariableTable.
+
+    ART's JDWP GetValues expects raw DEX register numbers (parameters sit
+    in the highest registers), not JVM slot numbering — observed on
+    Android 15: JVM-style slots fail with INVALID_SLOT / TYPE_MISMATCH.
+    Returns None when the variable table is absent (stripped debug info);
+    callers then fall back to the JVM slot as-is.
+    """
+    try:
+        vt = c.method_var_table(type_id, method_id)
+    except Exception:
+        return None
+    by_slot = sorted(vt["slots"], key=lambda s: s["slot"], reverse=True)
+    params, words = [], 0
+    for e in by_slot:
+        params.append(e)
+        words += 2 if e["sig"] in ("J", "D") else 1
+        if words >= vt["arg_cnt"]:
+            break
+    if not params or words != vt["arg_cnt"]:
+        return None
+    out, jvm = {}, 0
+    for e in reversed(params):
+        out[jvm] = e["slot"]
+        jvm += 2 if e["sig"] in ("J", "D") else 1
+    return out
+
+
 def capture_spec(c: JdwpClient, thread: int, frame_id: int,
-                 spec: list[dict], **kw) -> dict:
-    """spec: [{"slot": 1, "type": "byte[]", "label": "input"}, ...]"""
+                 spec: list[dict], vregs: dict[int, int] | None = None,
+                 **kw) -> dict:
+    """spec: [{"slot": 1, "type": "byte[]", "label": "input"}, ...]
+    vregs: optional JVM-slot -> DEX-vreg map (see arg_vreg_map)."""
     out = {}
     for item in spec:
         label = item.get("label", f"slot{item['slot']}")
+        slot = vregs.get(item["slot"], item["slot"]) if vregs else item["slot"]
         try:
-            out[label] = capture_value(c, thread, frame_id, item["slot"],
+            out[label] = capture_value(c, thread, frame_id, slot,
                                        item["type"], **kw)
         except Exception as e:  # slot may be invalid for some overloads
             out[label] = {"error": str(e)[:120]}

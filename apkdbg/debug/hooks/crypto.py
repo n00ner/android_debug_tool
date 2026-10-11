@@ -5,8 +5,10 @@ of how obfuscated the caller is (framework signatures are never obfuscated).
 Mechanics per hook:
   1. ClassesBySignature on the *framework* class (always loadable once used)
   2. Breakpoint at the method's first bytecode index (method entry)
-  3. On hit (suspend EVENT_THREAD): frame 0 -> read arg slots by position
-     (instance method: slot 0 = this, args follow, longs/doubles take 2 slots)
+  3. On hit (suspend EVENT_THREAD): frame 0 -> read args by position
+     (capture spec uses JVM-style slots: 0 = this, args follow, wide args
+     take two slots; translated to ART DEX vregs via the LocalVariableTable
+     at install time, see capture.arg_vreg_map)
   4. byte[] args -> hex+b64+utf8 via ArrayReference; String via
      StringReference; Key objects -> invoke getEncoded()/getAlgorithm()
   5. Resume the thread; emit one minified JSON record per hit
@@ -20,6 +22,14 @@ must be filtered by exact method id at capture time.
 Registration state lives in session.bp_registry (per-session, cleared on
 reconnect): every request id maps to its event kind, hook name, target
 class/method/sig, and owner.
+
+Metadata invokes (getAlgorithm/getEncoded) run on the event-suspended
+thread with INVOKE_SINGLE_THREADED — a debugger-driven invoke can re-enter
+hooked code or stall behind the thread's own suspension, so the policy is:
+at most the invokes declared per hook, one round-trip each, bounded by the
+client reply timeout; a stalled/failed invoke is reported as meta_error in
+the record and never blocks resume or teardown. Do not add invoke chains
+that call back into hooked methods.
 """
 
 from __future__ import annotations
@@ -33,7 +43,7 @@ from ...device.jdwp import (
 )
 from ...errors import ResolveError, SessionError
 from ...protocol import log_progress
-from ..capture import capture_spec, decode_tagged, invoke_meta
+from ..capture import arg_vreg_map, capture_spec, decode_tagged, invoke_meta
 
 GET_ALGO = {"method": "getAlgorithm", "sig": "()Ljava/lang/String;",
             "label": "algorithm"}
@@ -104,7 +114,7 @@ def install(session, names: list[str] | None = None,
                 "kind": r["kind"], "phase": r["phase"],
                 "cls": hook["cls"], "type_id": r["type_id"],
                 "method": hook["method"], "sig": hook["sig"],
-                "method_id": r["method_id"],
+                "method_id": r["method_id"], "vregs": r["vregs"],
                 "spec": hook["method"] + hook["sig"]}
     return {"installed": installed, "pending": pending,
             "note": "pending hooks: class not loaded yet; re-install later"}
@@ -131,18 +141,19 @@ def _install_one(c: JdwpClient, hook: dict,
                 idx = lt["lines"][0]["index"] if lt["lines"] else 0
             except Exception:
                 idx = 0  # no debug info on framework classes: entry = index 0
+            vregs = arg_vreg_map(c, cls["type_id"], m["id"])
             rid = c.set_breakpoint(cls["type_id"], m["id"], idx,
                                    SP_EVENT_THREAD)
             regs.append({"rid": rid, "kind": EVK_BREAKPOINT,
                          "phase": "entry", "type_id": cls["type_id"],
-                         "method_id": m["id"]})
+                         "method_id": m["id"], "vregs": vregs})
             if capture_returns:
                 rid = c.set_event(
                     EVK_METHOD_EXIT_RET, SP_EVENT_THREAD,
                     [c.mod_class_only(cls["type_id"])])
                 regs.append({"rid": rid, "kind": EVK_METHOD_EXIT_RET,
                              "phase": "return", "type_id": cls["type_id"],
-                             "method_id": m["id"]})
+                             "method_id": m["id"], "vregs": vregs})
     except Exception:
         for r in regs:
             try:
@@ -174,10 +185,11 @@ def extract_event(session, ev: dict) -> dict | None:
         except Exception as e:
             rec["capture_error"] = str(e)[:120]
         return rec
-    return _extract_entry(session, hook, thread)
+    return _extract_entry(session, reg, thread)
 
 
-def _extract_entry(session, hook: dict, thread: int) -> dict:
+def _extract_entry(session, reg: dict, thread: int) -> dict:
+    hook = reg["hook_def"]
     c = session.client
     rec = {"hook": hook["name"], "thread": thread, "phase": "entry"}
     try:
@@ -185,7 +197,8 @@ def _extract_entry(session, hook: dict, thread: int) -> dict:
         if not frames:
             raise SessionError(f"thread {thread} has no frames")
         fr = frames[0]
-        rec["args"] = capture_spec(c, thread, fr["frame_id"], hook["capture"])
+        rec["args"] = capture_spec(c, thread, fr["frame_id"],
+                                   hook["capture"], vregs=reg.get("vregs"))
     except Exception as e:
         rec["capture_error"] = str(e)[:120]
         return rec
