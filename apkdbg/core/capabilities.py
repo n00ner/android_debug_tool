@@ -327,13 +327,24 @@ def _probe_line_table(client: JdwpClient, project, sample: int = 5) -> dict:
             classes = client.classes_by_signature(row["sig"])
             if not classes:
                 continue
-            sampled += 1
-            for m in client.rt_methods(classes[0]["type_id"])[:5]:
-                lt = client.method_line_table(classes[0]["type_id"],
-                                              m["id"])
+            tid = classes[0]["type_id"]
+            observed = False
+            for m in client.rt_methods(tid)[:5]:
+                if m.get("mod_bits", 0) & 0x0500:  # native | abstract
+                    continue
+                try:
+                    lt = client.method_line_table(tid, m["id"])
+                except ApkDbgError as e:
+                    log_progress(
+                        f"line-table probe: {row['sig']}.{m['name']}: {e}")
+                    continue
+                observed = True
                 if lt["lines"]:
                     with_lines += 1
                     break
+            if not observed:
+                continue
+            sampled += 1
         except ApkDbgError as e:
             log_progress(f"line-table probe: {row['sig']}: {e}")
     if not sampled:

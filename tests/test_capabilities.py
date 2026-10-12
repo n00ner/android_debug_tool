@@ -382,6 +382,70 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(rep["capabilities"]["jdwp_attach"]["source"],
                          "observed")
 
+    def _line_table_probe(self, rt_methods, line_table):
+        """Run _probe_line_table against a client stub serving the given
+        per-class methods/line-table behaviour; one indexed class."""
+        make_project(self.root, line_rows=2, manifest_debuggable="true")
+
+        class FakeClient:
+            def classes_by_signature(self, sig): return [{"type_id": 7}]
+            def rt_methods(self, tid): return rt_methods
+            def method_line_table(self, tid, mid): return line_table(mid)
+
+        project = Project.open(self.root)
+        return capmod._probe_line_table(FakeClient(), project)
+
+    def test_native_first_method_does_not_hide_valid_line_table(self):
+        from apkdbg.errors import JdwpError
+        calls = []
+
+        def line_table(mid):
+            calls.append(mid)
+            if mid == 1:
+                raise JdwpError("NATIVE_METHOD")
+            return {"lines": [{"line": 10, "index": 0}]}
+
+        obs = self._line_table_probe(
+            [{"id": 1, "name": "nativeRun", "sig": "()V",
+              "mod_bits": 0x0100},
+             {"id": 2, "name": "run", "sig": "()V", "mod_bits": 0x0001}],
+            line_table)
+        # native/abstract methods are skipped outright, never queried
+        self.assertEqual(calls, [2])
+        self.assertEqual(obs["classes_sampled"], 1)
+        self.assertEqual(obs["classes_with_line_tables"], 1)
+        self.assertEqual(obs["availability"], "present")
+
+    def test_per_method_metadata_failure_keeps_sampling(self):
+        from apkdbg.errors import JdwpError
+
+        def line_table(mid):
+            if mid == 1:
+                raise JdwpError("ABSENT_INFORMATION")
+            return {"lines": [{"line": 10, "index": 0}]}
+
+        obs = self._line_table_probe(
+            [{"id": 1, "name": "a", "sig": "()V", "mod_bits": 0x0001},
+             {"id": 2, "name": "b", "sig": "()V", "mod_bits": 0x0001}],
+            line_table)
+        self.assertEqual(obs["classes_sampled"], 1)
+        self.assertEqual(obs["classes_with_line_tables"], 1)
+        self.assertEqual(obs["availability"], "present")
+
+    def test_class_with_no_observable_method_is_not_sampled(self):
+        from apkdbg.errors import JdwpError
+
+        def line_table(mid):
+            raise JdwpError("ABSENT_INFORMATION")
+
+        obs = self._line_table_probe(
+            [{"id": 1, "name": "a", "sig": "()V", "mod_bits": 0x0001}],
+            line_table)
+        # every method lookup failed: no meaningful observation, stays unknown
+        self.assertEqual(obs["classes_sampled"], 0)
+        self.assertEqual(obs["classes_with_line_tables"], 0)
+        self.assertEqual(obs["availability"], "unknown")
+
 
 class ManifestParsingTests(unittest.TestCase):
     def setUp(self):
