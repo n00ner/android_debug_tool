@@ -162,9 +162,13 @@ def cmd_cond(ctx: Ctx, spec: str, pred: dict, capture: list[dict],
 
 def cmd_hook_crypto(ctx: Ctx, duration: float = 60.0,
                     hooks: list[str] | None = None,
-                    returns: bool = False) -> dict:
+                    returns: bool = False,
+                    max_events: int = 1000,
+                    max_bytes: int = 1 << 20) -> dict:
     return crypto_hooks.run_watch(ctx.session, duration_s=duration,
-                                  names=hooks, capture_returns=returns)
+                                  names=hooks, capture_returns=returns,
+                                  max_events=max_events,
+                                  max_bytes=max_bytes)
 
 
 def cmd_coverage(ctx: Ctx, packages: list[str], mode: str = "method",

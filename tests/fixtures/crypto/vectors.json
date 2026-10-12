@@ -1,0 +1,9 @@
+{
+  "comment": "Ground truth for tests/fixtures/crypto. AES-CBC ciphertext verified with: printf '6bc1bee22e409f96e93d7e117393172a' | xxd -r -p | openssl enc -aes-128-cbc -K 2b7e151628aed2a6abf7158809cf4f3c -iv 000102030405060708090a0b0c0d0e0f | xxd -p -c 256 (openssl pads PKCS#7, equivalent to Java PKCS5Padding for 16-byte blocks). HMAC/SHA-256 computed with Python hmac/hashlib.",
+  "aes_key_hex": "2b7e151628aed2a6abf7158809cf4f3c",
+  "iv_hex": "000102030405060708090a0b0c0d0e0f",
+  "plaintext_hex": "6bc1bee22e409f96e93d7e117393172a",
+  "aes_128_cbc_pkcs5_ciphertext_hex": "7649abac8119b246cee98e9b12e9197d8964e0b149c10b7b682e6e39aaeb731c",
+  "hmac_sha256_hex": "94f76f0337f479561e5d712efc069de2ab25832f4551a35f05f94ac1df49097d",
+  "sha256_hex": "a063df83a8c28a49daf4aeba0e29ee7b2177e8511072944c3d299cf77dc83e7a"
+}
