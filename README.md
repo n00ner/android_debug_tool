@@ -60,7 +60,7 @@ Key design decisions:
 | `branch_sites` | parsed `if-*`/`goto`/switch | `dalvik_line`, `opcode`, `kind`, `target_dalvik_line` |
 | `resources` | from apktool `public.xml` | `res_id` (0x7f… int), `type`, `name` |
 | `resource_refs` | resource call sites in smali | `res_id`, `method_id`, `kind` (`getString`…) |
-| `coverage_hits` | persisted coverage runs | `run_id`, `class_sig`, `dalvik_line`, `hits` |
+| `coverage_hits` | persisted coverage runs | `run_id`, `class_sig`, `method_name`, `method_sig`, `dalvik_line`, `hits` |
 | `alias_candidates` | reviewable runtime alias hypotheses (#25) | `class_sig`, `candidate`, `heuristic_score`, `rule`, `status`, `evidence` |
 | `alias_decisions` | full review trail per candidate | `candidate_id`, `action`, `from_status`, `to_status` |
 
