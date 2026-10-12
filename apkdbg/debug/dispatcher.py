@@ -35,7 +35,9 @@ SuspensionLease. Subscriber callbacks run first; only then does the lease
 release each suspension exactly once per thread — never twice, never before
 every owning consumer finished. A subscriber may retain() a thread to
 preserve a user-owned stop (e.g. a matched conditional breakpoint stays
-suspended for inspection). SP_NONE composites never trigger a resume.
+suspended for inspection). Threads that also carry an unclaimed event of
+the same composite are retained automatically: the stop belongs to its
+public consumer. SP_NONE composites never trigger a resume.
 SP_ALL is released per event-thread (status quo; a full VM resume would
 also drop unrelated user stops).
 
@@ -262,6 +264,10 @@ class EventDispatcher:
                 if t is not None:
                     threads.add(t)
         lease = SuspensionLease(self.session, threads)
+        for ev in unclaimed:  # an unclaimed stop on a claimed thread keeps it
+            t = ev.get("thread")
+            if t is not None and t in lease.threads:
+                lease.retain(t)
         for s, ev in deliveries:
             try:
                 s.callback(ev, lease)
