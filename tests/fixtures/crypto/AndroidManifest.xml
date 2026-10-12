@@ -11,6 +11,8 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.apkdbg.cryptofixture.RUN" />
+                <action android:name="com.apkdbg.cryptofixture.STRINGS" />
+                <action android:name="com.apkdbg.cryptofixture.BENCH" />
             </intent-filter>
         </receiver>
     </application>

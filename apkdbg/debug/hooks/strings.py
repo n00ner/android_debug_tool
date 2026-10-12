@@ -258,7 +258,8 @@ def install(session, profiles: list, mode: str = "attributed", *,
     d = session.events
     installed, pending, deferred = [], [], []
     states = {}
-    for prof in profiles:
+    for spec in profiles:
+        prof = resolve_profile(spec)  # idempotent for resolved dicts
         try:
             regs = _install_one(session, prof, sp, thread, mod_count)
         except ClassNotLoaded as e:
