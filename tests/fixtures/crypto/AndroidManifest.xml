@@ -28,6 +28,7 @@
                 <action android:name="com.apkdbg.cryptofixture.FW_SVC" />
                 <action android:name="com.apkdbg.cryptofixture.FW_BENCH" />
                 <action android:name="com.apkdbg.cryptofixture.BUFFERS" />
+                <action android:name="com.apkdbg.cryptofixture.UNPACK" />
             </intent-filter>
         </receiver>
     </application>
