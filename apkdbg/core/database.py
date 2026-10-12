@@ -112,6 +112,31 @@ CREATE TABLE IF NOT EXISTS coverage_hits (
   UNIQUE(run_id, class_sig, method_name, method_sig, dalvik_line)
 );
 
+-- observed branch-site outcomes per coverage run (issue #29): taken /
+-- fallthrough / unknown are stored separately, unknowns keep their reasons
+-- and are never resolved into edges after the fact. Site identity is the
+-- descriptor-level site_key (class->name(desc):dalvik_line:smali_line) —
+-- the local integer branch_sites.id is not portable between rebuilt
+-- indexes, so it is not persisted. Rows join to runs for the APK hash /
+-- index generation they were captured against.
+CREATE TABLE IF NOT EXISTS coverage_branch_sites (
+  id           INTEGER PRIMARY KEY,
+  run_id       TEXT NOT NULL,
+  site_key     TEXT NOT NULL,
+  class_sig    TEXT,
+  method_name  TEXT,
+  method_sig   TEXT,
+  dalvik_line  INTEGER,
+  smali_line   INTEGER,
+  opcode       TEXT,
+  kind         TEXT,            -- if | goto | switch
+  site_hits    INTEGER DEFAULT 0,
+  taken        INTEGER DEFAULT 0,
+  fallthrough  INTEGER DEFAULT 0,
+  unknowns     TEXT,            -- JSON {reason: count}; absent means none
+  UNIQUE(run_id, site_key)
+);
+
 -- investigation run manifests (issue #36): durable identity for runtime
 -- observations, stored independently of the replaceable static index
 -- (init rebuilds the derived tables above in a staged generation and

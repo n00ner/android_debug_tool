@@ -18,6 +18,7 @@ from .debug.hooks import crypto as crypto_hooks
 from .debug.hooks import framework as framework_hooks
 from .debug.hooks import strings as string_hooks
 from .debug import unpack as unpack_hooks
+from .debug import covdiff
 from .debug.session import DebugSession
 from .debug.snapdiff import snapshot_diff
 from .debug.snapshot import Budgets, Snapshotter
@@ -473,6 +474,24 @@ def cmd_snapshot_diff(ctx: Ctx, a: str, b: str, force: bool = False) -> dict:
     return snapshot_diff(RunStore(ctx.project), a, b, force=force)
 
 
+# --------------------------------------------- coverage diff (issue #29)
+def cmd_coverage_diff(ctx: Ctx, baseline: str, candidate: str,
+                      exploratory: bool = False,
+                      filter: str | None = None,
+                      change: str | None = None,
+                      limit: int = 50, offset: int = 0) -> dict:
+    """Offline diff of stored coverage runs: baseline vs candidate group
+    (labels match scenario or run_id; same label twice = A/A baseline
+    variation via a deterministic split). Ranks presence / supported
+    direction / normalized hit-count changes with explainable scores and
+    confidence; incompatible runs (APK/index identity, mode, scope) are
+    rejected unless exploratory=True (annotated intersection only)."""
+    limit, offset = _page(limit, offset)
+    return covdiff.coverage_diff(ctx.project, baseline, candidate,
+                                 exploratory=exploratory, filter=filter,
+                                 change=change, limit=limit, offset=offset)
+
+
 # ------------------------------------------------- buffer export (issue #38)
 def cmd_export_buffer(ctx: Ctx, obj: int, epoch: int, source: str = "auto",
                       offset: int | None = None, length: int | None = None,
@@ -884,6 +903,7 @@ COMMANDS = {
     "coverage": cmd_coverage,
     "runs": cmd_runs,
     "snapshot_diff": cmd_snapshot_diff,
+    "coverage_diff": cmd_coverage_diff,
     "export_buffer": cmd_export_buffer,
     "unpack": cmd_unpack,
     "unpack_index": cmd_unpack_index,

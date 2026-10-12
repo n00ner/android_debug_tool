@@ -61,6 +61,7 @@ Key design decisions:
 | `resources` | from apktool `public.xml` | `res_id` (0x7f… int), `type`, `name` |
 | `resource_refs` | resource call sites in smali | `res_id`, `method_id`, `kind` (`getString`…) |
 | `coverage_hits` | persisted coverage runs | `run_id`, `class_sig`, `method_name`, `method_sig`, `dalvik_line`, `hits` |
+| `coverage_branch_sites` | persisted branch outcomes (#29) | `run_id`, `site_key` (`class->name(desc):dalvik_line:smali_line`), `site_hits`, `taken`, `fallthrough`, `unknowns` (JSON reasons) |
 | `alias_candidates` | reviewable runtime alias hypotheses (#25) | `class_sig`, `candidate`, `heuristic_score`, `rule`, `status`, `evidence` |
 | `alias_decisions` | full review trail per candidate | `candidate_id`, `action`, `from_status`, `to_status` |
 
@@ -71,7 +72,7 @@ candidate text never feeds back into resolution or breakpoint targeting.
 ## Command surface
 
 Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
-`runs`, `snapshot_diff`, `aliases`, `strings`.
+`runs`, `snapshot_diff`, `coverage_diff`, `aliases`, `strings`.
 Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
 `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
 `snapshot`, `dump_object`, `cond`, `hook_crypto`, `watch_strings`,

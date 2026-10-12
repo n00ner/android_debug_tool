@@ -409,6 +409,35 @@ _META: dict[str, dict] = {
                    "b": "artifact id (or run id with one snapshot)",
                    "force": "compare despite incompatibilities"},
     },
+    "coverage_diff": {
+        "summary": "offline comparison of stored coverage run groups "
+                   "(issue #29): ranks presence / supported branch-"
+                   "direction / normalized hit-count changes with "
+                   "explainable scores, per-run repeatability, and "
+                   "confidence lowered by unknown outcomes and degraded "
+                   "traces — candidates for investigation, never exact "
+                   "subtraction",
+        "result": "{\"baseline\"/{\"candidate\": group run quality, "
+                  "\"compatibility\" report, \"quality\" (degraded runs, "
+                  "exact_subtraction=false), \"ranked\": scored change "
+                  "candidates with supporting per-run observations, "
+                  "count/total/limit/offset/truncated}; incompatible "
+                  "runs return ranked=null with explicit reasons unless "
+                  "exploratory (annotated intersection)",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False, "pagination": True,
+        "params": {"baseline": "baseline group label (scenario or "
+                               "run_id)",
+                   "candidate": "candidate group label; same label as "
+                                "baseline = A/A baseline variation via "
+                                "deterministic split",
+                   "exploratory": "compare incompatible runs anyway: "
+                                  "annotated intersection, not "
+                                  "equivalent coverage",
+                   "filter": "substring match on compared keys",
+                   "change": "restrict to presence | direction | "
+                             "hit_count"},
+    },
     "unpack": {
         "summary": "EXPERIMENTAL runtime DEX payload discovery at selected "
                    "loading/decryption boundaries (issue #28) — NOT a "

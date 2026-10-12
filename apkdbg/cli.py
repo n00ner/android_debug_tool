@@ -316,6 +316,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="compare despite incompatibilities (qualifications "
                          "are kept in the output)")
 
+    sp = sub.add_parser("coverage_diff",
+                        help="offline diff of stored coverage runs with "
+                             "uncertainty ranking (issue #29)")
+    sp.add_argument("--baseline", required=True,
+                    help="baseline group label (scenario or run_id)")
+    sp.add_argument("--candidate", required=True,
+                    help="candidate group label (scenario or run_id); "
+                         "same label as --baseline = A/A baseline "
+                         "variation (deterministic split of its runs)")
+    sp.add_argument("--exploratory", action="store_true",
+                    help="compare incompatible runs anyway: annotated "
+                         "intersection of observed keys, never presented "
+                         "as equivalent coverage")
+    sp.add_argument("--filter", help="substring match on compared keys")
+    sp.add_argument("--change", choices=["presence", "direction",
+                                         "hit_count"],
+                    help="restrict to one change type")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+
     sub.add_parser("native", help="list native methods + lldb plan")
 
     sp = sub.add_parser("export_buffer",
