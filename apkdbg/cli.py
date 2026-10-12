@@ -163,6 +163,63 @@ def build_parser() -> argparse.ArgumentParser:
                          "(implies --record for evidence)")
     sp.add_argument("--pkg")
 
+    sp = sub.add_parser("watch_strings",
+                        help="scoped string watchers (issue #26)")
+    sp.add_argument("--duration", type=float, default=60.0)
+    sp.add_argument("--profiles",
+                    help="JSON array: builtin names and/or explicit "
+                         '{"cls","method","sig"} objects '
+                         "(default: stringbuilder.tostring)")
+    sp.add_argument("--mode", default="attributed",
+                    choices=["best_effort", "attributed"],
+                    help="best_effort: SP_NONE, no attribution, object loss "
+                         "counted; attributed: SP_EVENT_THREAD, string + "
+                         "bounded stack while suspended")
+    sp.add_argument("--scope",
+                    help="app scope for attribution (JDWP class-match "
+                         "pattern, e.g. com.example.*)")
+    sp.add_argument("--text-regex",
+                    help="keep only matching texts (post-read filter)")
+    sp.add_argument("--min-printable", type=float, default=0.0,
+                    help="min printable-char ratio 0..1 (post-read filter)")
+    sp.add_argument("--no-dedupe", action="store_true",
+                    help="disable value-based session dedupe")
+    sp.add_argument("--max-events", type=int, default=1000)
+    sp.add_argument("--max-reads", type=int, default=5000)
+    sp.add_argument("--max-output-bytes", type=int, default=1 << 20)
+    sp.add_argument("--max-queue", type=int, default=64,
+                    help="stop when unrelated stashed composites exceed "
+                         "this (queue pressure)")
+    sp.add_argument("--max-stack", type=int, default=8)
+    sp.add_argument("--max-str", type=int, default=512)
+    sp.add_argument("--thread", type=int,
+                    help="restrict capture to this thread (ThreadOnly "
+                         "request modifier)")
+    sp.add_argument("--mod-count", type=int,
+                    help="MOD_COUNT=N: ONE event after N-1 earlier matches "
+                         "are skipped — NOT a first-N budget")
+    sp.add_argument("--defer", action="store_true",
+                    help="CLASS_PREPARE-watch pending profiles and "
+                         "auto-install when their class loads")
+    sp.add_argument("--record", action="store_true",
+                    help="persist the watch as a run manifest with one "
+                         "event row per captured record")
+    sp.add_argument("--scenario")
+    sp.add_argument("--collect-aliases", action="store_true",
+                    help="feed captured strings to the alias collector "
+                         "(implies --record for evidence)")
+    sp.add_argument("--pkg")
+
+    sp = sub.add_parser("strings",
+                        help="offline query of persisted string-watch "
+                             "records (issue #26)")
+    sp.add_argument("--run-id")
+    sp.add_argument("--profile")
+    sp.add_argument("--mode", choices=["best_effort", "attributed"])
+    sp.add_argument("--text", help="substring match on captured text")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+
     sp = sub.add_parser("coverage", help="branch/method coverage")
     sp.add_argument("--packages", required=True, help="comma-separated")
     sp.add_argument("--mode", default="method", choices=["method", "line"])
@@ -223,7 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
 # verbs that need a live JDWP session; CLI auto-connects when --pkg is given
 SESSION_VERBS = {"bp", "bp_del", "bp_list", "events", "read_var", "write_var",
                  "invoke", "step", "resume", "restore", "snapshot",
-                 "dump_object", "cond", "hook_crypto", "coverage", "native"}
+                 "dump_object", "cond", "hook_crypto", "watch_strings",
+                 "coverage", "native"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,8 +319,11 @@ def _kwargs(args: argparse.Namespace) -> dict:
     for k, v in vars(args).items():
         if k in ("cmd", "project", "serial") or v is None:
             continue
-        if k in ("value", "pred", "capture", "args") and isinstance(v, str):
+        if k in ("value", "pred", "capture", "args", "profiles") \
+                and isinstance(v, str):
             v = json.loads(v)
+        if k == "no_dedupe":
+            k, v = "dedupe", not v
         if k == "hooks" and isinstance(v, str):
             v = [x.strip() for x in v.split(",") if x.strip()]
         if k == "packages" and isinstance(v, str):

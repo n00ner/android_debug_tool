@@ -246,6 +246,65 @@ _META: dict[str, dict] = {
                    "collect_aliases": "feed captured strings to the alias "
                                       "collector (implies record)"},
     },
+    "watch_strings": {
+        "summary": "scoped string watchers (issue #26): producer-return "
+                   "and consumer-argument observation points via method-exit "
+                   "events, with explicit best_effort/attributed capture "
+                   "modes — observation points only, never full string "
+                   "coverage",
+        "result": "captured string records with attribution status, "
+                  "received/filtered/matched/unavailable/truncated/dropped "
+                  "counts, stop reason, and a coverage note; with "
+                  "collect_aliases also an alias_collection report",
+        "mutates": True, "idempotent": False, "retryable": False,
+        "project": True, "session": True,
+        "params": {"duration": "watch window in seconds",
+                   "profiles": "builtin names and/or explicit "
+                               "{\"cls\",\"method\",\"sig\"} objects "
+                               "(default: stringbuilder.tostring)",
+                   "mode": "best_effort (SP_NONE, no attribution, object "
+                           "loss counted) | attributed (SP_EVENT_THREAD, "
+                           "string + bounded stack while suspended)",
+                   "scope": "app scope for attribution, JDWP class-match "
+                            "pattern, e.g. com.example.*",
+                   "text_regex": "keep only matching texts (applied AFTER "
+                                 "the text read)",
+                   "min_printable": "min printable-char ratio 0..1 "
+                                    "(post-read filter)",
+                   "dedupe": "value-based session dedupe of identical texts",
+                   "max_events": "safety bound on emitted records",
+                   "max_reads": "safety bound on JDWP reads issued by "
+                                "extraction",
+                   "max_output_bytes": "safety bound on captured payload "
+                                       "bytes",
+                   "max_queue": "stop when unrelated stashed composites "
+                                "exceed this (queue pressure)",
+                   "max_stack": "stack depth bound for attribution",
+                   "max_str": "per-string length bound (longer strings are "
+                              "truncated and counted)",
+                   "thread": "restrict capture to this thread "
+                             "(request-level ThreadOnly modifier)",
+                   "mod_count": "MOD_COUNT=N: deliver ONE event after N-1 "
+                                "earlier matches are skipped — NOT a "
+                                "first-N budget",
+                   "defer": "CLASS_PREPARE-watch pending profiles and "
+                            "auto-install when their class loads",
+                   "record": "persist the watch as a run manifest",
+                   "scenario": "scenario label for the run",
+                   "collect_aliases": "feed captured strings to the alias "
+                                      "collector (implies record)"},
+    },
+    "strings": {
+        "summary": "offline query over persisted string-watch records "
+                   "(issue #26)",
+        "result": "{\"records\": [...], count/total/limit/offset/truncated}",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False, "pagination": True,
+        "params": {"run_id": "restrict to one run",
+                   "profile": "restrict to one source profile",
+                   "mode": "restrict to one capture mode (run config)",
+                   "text": "substring match on captured text"},
+    },
     "coverage": {
         "summary": "method- or line-level coverage for the given packages",
         "result": "hit tables with budget/truncation metadata",

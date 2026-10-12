@@ -19,7 +19,7 @@ ANDROID_JAR="$SDK/platforms/android-30/android.jar"
 rm -rf out && mkdir -p out/classes out/dex
 
 "$JAVAC" -source 8 -target 8 -classpath "$ANDROID_JAR" \
-    -d out/classes src/com/apkdbg/cryptofixture/RunReceiver.java
+    -d out/classes src/com/apkdbg/cryptofixture/*.java
 
 "$JAVA" -cp "$BT/lib/d8.jar" com.android.tools.r8.D8 \
     --min-api 24 --lib "$ANDROID_JAR" \

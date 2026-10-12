@@ -71,10 +71,11 @@ candidate text never feeds back into resolution or breakpoint targeting.
 ## Command surface
 
 Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
-`runs`, `snapshot_diff`, `aliases`.
+`runs`, `snapshot_diff`, `aliases`, `strings`.
 Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
 `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
-`snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`, `native`.
+`snapshot`, `dump_object`, `cond`, `hook_crypto`, `watch_strings`,
+`coverage`, `native`.
 
 ```bash
 # 1. init: decompile + build mapping DB
@@ -101,6 +102,12 @@ apkdbg --project ./proj serve
 # coverage: cheap method mode, or line mode scoped to a thread
 {"id":9,"method":"coverage","params":{"packages":["com.target"],"mode":"method","seconds":60}}
 {"id":10,"method":"coverage","params":{"packages":["com.target.crypto"],"mode":"line","thread":1234,"seconds":30}}
+
+# string watchers (issue #26): attributed capture at a selected decryptor,
+# plus the opt-in broad StringBuilder profile — observation points only,
+# never full string coverage
+{"id":11,"method":"watch_strings","params":{"duration":60,"mode":"attributed","scope":"com.target.*","record":true,"profiles":[{"cls":"Lcom/target/Dec;","method":"decrypt","sig":"([B)Ljava/lang/String;"},"stringbuilder.tostring"]}}
+{"id":12,"method":"strings","params":{"text":"https://","limit":20}}
 ```
 
 ## Runtime alias candidates (review workflow, issue #25)

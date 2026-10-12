@@ -14,6 +14,7 @@ from .debug.aliascollect import AliasCollector
 from .debug.conditions import ConditionalEngine
 from .debug.coverage import CoverageTracker
 from .debug.hooks import crypto as crypto_hooks
+from .debug.hooks import strings as string_hooks
 from .debug.session import DebugSession
 from .debug.snapdiff import snapshot_diff
 from .debug.snapshot import Budgets, Snapshotter
@@ -304,6 +305,52 @@ def cmd_hook_crypto(ctx: Ctx, duration: float = 60.0,
                                   collect_aliases=collect_aliases)
 
 
+# ---------------------------------------------------- string watchers (issue #26)
+def cmd_watch_strings(ctx: Ctx, duration: float = 60.0,
+                      profiles: list | None = None,
+                      mode: str = "attributed",
+                      scope: str | None = None,
+                      text_regex: str | None = None,
+                      min_printable: float = 0.0,
+                      dedupe: bool = True,
+                      max_events: int = 1000,
+                      max_reads: int = 5000,
+                      max_output_bytes: int = 1 << 20,
+                      max_queue: int = 64,
+                      max_stack: int = 8,
+                      max_str: int = 512,
+                      thread: int | None = None,
+                      mod_count: int | None = None,
+                      defer: bool = False,
+                      record: bool = False,
+                      scenario: str | None = None,
+                      collect_aliases: bool = False) -> dict:
+    """Scoped string watchers: producer-return and consumer-argument
+    observation points with explicit capture modes. profiles: builtin names
+    and/or explicit {"cls","method","sig"} objects (default: the opt-in
+    stringbuilder.tostring profile)."""
+    return string_hooks.run_watch(
+        ctx.session, profiles=profiles, mode=mode, duration_s=duration,
+        scope=scope, text_regex=text_regex, min_printable=min_printable,
+        dedupe=dedupe, max_events=max_events, max_reads=max_reads,
+        max_output_bytes=max_output_bytes, max_queue=max_queue,
+        max_stack=max_stack, max_str=max_str, thread=thread,
+        mod_count=mod_count, defer=defer, record=record,
+        scenario=scenario, collect_aliases=collect_aliases)
+
+
+def cmd_strings(ctx: Ctx, run_id: str | None = None,
+                profile: str | None = None, mode: str | None = None,
+                text: str | None = None, limit: int = 50,
+                offset: int = 0) -> dict:
+    """Offline query over persisted string-watch records (bounded
+    pagination, substring text filter)."""
+    limit, offset = _page(limit, offset)
+    return string_hooks.query_records(
+        ctx.project, run_id=run_id, profile=profile, mode=mode, text=text,
+        limit=limit, offset=offset)
+
+
 def cmd_coverage(ctx: Ctx, packages: list[str], mode: str = "method",
                  thread: int | None = None, budget: int = 20000,
                  seconds: int = 60, scenario: str | None = None) -> dict:
@@ -455,6 +502,8 @@ COMMANDS = {
     "dump_object": cmd_dump_object,
     "cond": cmd_cond,
     "hook_crypto": cmd_hook_crypto,
+    "watch_strings": cmd_watch_strings,
+    "strings": cmd_strings,
     "coverage": cmd_coverage,
     "runs": cmd_runs,
     "snapshot_diff": cmd_snapshot_diff,

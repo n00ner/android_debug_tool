@@ -20,6 +20,9 @@ import javax.crypto.spec.SecretKeySpec;
  */
 public class RunReceiver extends BroadcastReceiver {
     public static final String ACTION_RUN = "com.apkdbg.cryptofixture.RUN";
+    public static final String ACTION_RUN_STRINGS =
+            "com.apkdbg.cryptofixture.STRINGS";
+    public static final String ACTION_BENCH = "com.apkdbg.cryptofixture.BENCH";
     private static final String TAG = "CryptoFixture";
 
     static final byte[] AES_KEY = hex("2b7e151628aed2a6abf7158809cf4f3c");
@@ -28,7 +31,20 @@ public class RunReceiver extends BroadcastReceiver {
 
     @Override
     public void onReceive(Context ctx, Intent intent) {
-        if (intent == null || !ACTION_RUN.equals(intent.getAction())) {
+        if (intent == null) {
+            return;
+        }
+        if (ACTION_RUN_STRINGS.equals(intent.getAction())) {
+            StringWork.runAll();   // string-watcher fixture paths (#26)
+            return;
+        }
+        if (ACTION_BENCH.equals(intent.getAction())) {
+            int iters = intent.getIntExtra("iters", 200000);
+            long acc = StringWork.hotLoop(iters);
+            Log.i(TAG, "BENCH iters=" + iters + " acc=" + acc);
+            return;
+        }
+        if (!ACTION_RUN.equals(intent.getAction())) {
             return;
         }
         try {

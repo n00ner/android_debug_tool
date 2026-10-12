@@ -404,7 +404,7 @@ class CatalogCompletenessTests(unittest.TestCase):
 
     def test_pagination_metadata_complete(self):
         paginated = {"classes", "methods", "res", "res_refs", "bp_list",
-                     "runs", "native", "aliases"}
+                     "runs", "native", "aliases", "strings"}
         for name, fn in COMMANDS.items():
             with self.subTest(command=name):
                 e = apicatalog.entry_for(name)
