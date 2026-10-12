@@ -1,0 +1,66 @@
+{
+ "device": {
+  "ro.product.model": "23124RA7EO",
+  "ro.build.version.release": "15",
+  "ro.build.version.sdk": "35"
+ },
+ "steps": [
+  {
+   "step": "connected",
+   "pid": 23971,
+   "vm": "Dalvik"
+  },
+  {
+   "step": "receiver",
+   "obj": 3,
+   "runtime_type_id": 2,
+   "requested_type_id": 2
+  },
+  {
+   "step": "resolved",
+   "declaring_class_id": 8,
+   "method_id": 1883610936,
+   "inherited": true
+  },
+  {
+   "step": "invoke_getIntent",
+   "options": 1,
+   "value_tag": 76,
+   "value": 13,
+   "exception": 0
+  },
+  {
+   "step": "health_after_invoke",
+   "ok": true,
+   "resolved_sig": "Landroid/app/Activity;"
+  },
+  {
+   "step": "new_instance_rejected_locally",
+   "rejected": {
+    "code": "E_RESOLVE",
+    "msg": "NewInstance requires an <init> of class 14, got toString()Ljava/lang/String;"
+   },
+   "healthy": true
+  },
+  {
+   "step": "new_instance_ok",
+   "obj": 15,
+   "exception": 0
+  },
+  {
+   "step": "invoke_toString",
+   "value_tag": 115,
+   "string": "",
+   "exception": 0
+  }
+ ],
+ "vm": {
+  "package": "com.wolfs.myapplication",
+  "pid": 23971,
+  "port": 62940,
+  "vm": "Dalvik",
+  "jdwp": "1.8"
+ },
+ "healthy_end": true,
+ "pass": true
+}
