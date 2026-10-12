@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import base64
 
-from ..device.jdwp import JdwpClient, TAG_ARRAY, TAG_STRING, sig_to_tag
+from ..device.jdwp import (
+    JdwpClient, TAG_ARRAY, TAG_NAMES, TAG_STRING, sig_to_tag,
+)
 from ..errors import SessionError
 
 PRIM_TYPES = {"int": 73, "long": 74, "boolean": 90, "byte": 66,
@@ -47,17 +49,113 @@ def capture_value(c: JdwpClient, thread: int, frame_id: int, slot: int,
                            list(PRIM_TYPES) + ["string", "byte[]", "object"]))
 
 
+def arg_vreg_map(c: JdwpClient, type_id: int,
+                 method_id: int) -> dict[int, int] | None:
+    """Map JVM-style argument slots (0 = this for instance methods, then
+    args in declaration order, long/double taking two slots) to ART DEX
+    vreg numbers via the LocalVariableTable.
+
+    ART's JDWP GetValues expects raw DEX register numbers (parameters sit
+    in the highest registers), not JVM slot numbering — observed on
+    Android 15: JVM-style slots fail with INVALID_SLOT / TYPE_MISMATCH.
+    Returns None when the variable table is absent (stripped debug info);
+    callers then fall back to the JVM slot as-is.
+    """
+    try:
+        vt = c.method_var_table(type_id, method_id)
+    except Exception:
+        return None
+    by_slot = sorted(vt["slots"], key=lambda s: s["slot"], reverse=True)
+    params, words = [], 0
+    for e in by_slot:
+        params.append(e)
+        words += 2 if e["sig"] in ("J", "D") else 1
+        if words >= vt["arg_cnt"]:
+            break
+    if not params or words != vt["arg_cnt"]:
+        return None
+    out, jvm = {}, 0
+    for e in reversed(params):
+        out[jvm] = e["slot"]
+        jvm += 2 if e["sig"] in ("J", "D") else 1
+    return out
+
+
 def capture_spec(c: JdwpClient, thread: int, frame_id: int,
-                 spec: list[dict], **kw) -> dict:
-    """spec: [{"slot": 1, "type": "byte[]", "label": "input"}, ...]"""
+                 spec: list[dict], vregs: dict[int, int] | None = None,
+                 **kw) -> dict:
+    """spec: [{"slot": 1, "type": "byte[]", "label": "input"}, ...]
+    vregs: optional JVM-slot -> DEX-vreg map (see arg_vreg_map)."""
     out = {}
     for item in spec:
         label = item.get("label", f"slot{item['slot']}")
+        slot = vregs.get(item["slot"], item["slot"]) if vregs else item["slot"]
         try:
-            out[label] = capture_value(c, thread, frame_id, item["slot"],
+            out[label] = capture_value(c, thread, frame_id, slot,
                                        item["type"], **kw)
         except Exception as e:  # slot may be invalid for some overloads
             out[label] = {"error": str(e)[:120]}
+    return out
+
+
+def decode_tagged(c: JdwpClient, val: dict, *, max_bytes: int = 4096,
+                  max_str: int = 512) -> dict:
+    """Decode a tagged JDWP value (e.g. a METHOD_EXIT_WITH_RETURN_VALUE
+    return_value) to a compact JSON node, mirroring capture_value."""
+    tag, v = val.get("tag"), val.get("v")
+    if tag == TAG_ARRAY:
+        if not v:
+            return {"type": "byte[]", "v": None}
+        raw = c.byte_array(v, max_bytes)
+        return {"type": "byte[]", "len": c.array_length(v),
+                "hex": raw.hex(),
+                "b64": base64.b64encode(raw).decode(),
+                "utf8": _try_utf8(raw),
+                "trunc": c.array_length(v) > max_bytes}
+    if tag == TAG_STRING:
+        return {"type": "string",
+                "v": c.string_value(v, max_str) if v else None}
+    return {"type": TAG_NAMES.get(tag, f"tag_{tag}"), "v": v}
+
+
+def read_fields(c: JdwpClient, obj: int, specs: list[dict]) -> dict:
+    """Deadlock-free alternative to metadata invokes: read declared
+    instance fields of obj, walking the superclass chain of its runtime
+    class. Each spec: {"name": "algorithm", "label": "algorithm"}.
+    Values decode like invoke_meta results (strings plain, byte[] as
+    capture dicts); missing fields report an error node."""
+    out = {}
+    if not obj:
+        return out
+    try:
+        _, type_id = c.object_reftype(obj)
+    except Exception:
+        return out
+    todo = list(specs)
+    while type_id and todo:
+        try:
+            fields = c.rt_fields(type_id)
+        except Exception:
+            break
+        for spec in list(todo):
+            f = next((f for f in fields if f["name"] == spec["name"]),
+                     None)
+            if f is None:
+                continue
+            todo.remove(spec)
+            try:
+                v = c.object_get_values(obj, [f["id"]])[0]
+                node = decode_tagged(c, v)
+                out[spec["label"]] = node["v"] if node.get(
+                    "type") == "string" else node
+            except Exception as e:
+                out[spec["label"]] = {"error": str(e)[:120]}
+        try:
+            type_id = c.ct_superclass(type_id)
+        except Exception:
+            break
+    for spec in todo:
+        out[spec["label"]] = {"error": f"field {spec['name']!r} not found"}
     return out
 
 
@@ -65,24 +163,27 @@ def invoke_meta(c: JdwpClient, thread: int, obj: int,
                 invokes: list[dict]) -> dict:
     """Run metadata invokes on `this` (e.g. Cipher.getAlgorithm) while the
     thread is suspended. Each: {"method": "getAlgorithm",
-    "sig": "()Ljava/lang/String;", "label": "algorithm"}."""
+    "sig": "()Ljava/lang/String;", "label": "algorithm"}.
+    Resolution is the checked path (issue #22): the method is resolved to
+    its DECLARING class and invoked with that class ID — pairing a
+    subclass type ID with an inherited method ID killed the JDWP
+    connection on Android 15."""
     out = {}
     if not obj:
         return out
     try:
         _, type_id = c.object_reftype(obj)
-        methods = c.rt_methods(type_id)
     except Exception:
         return out
     for inv in invokes:
-        m = next((m for m in methods
-                  if m["name"] == inv["method"] and m["sig"] == inv["sig"]),
-                 None)
-        if not m:
-            out[inv["label"]] = {"error": "method not found"}
+        try:
+            def_cls, method_id = c.resolve_instance_method(
+                type_id, inv["method"], inv["sig"])
+        except Exception as e:
+            out[inv["label"]] = {"error": str(e)[:120]}
             continue
         try:
-            r = c.invoke_object_method(obj, thread, type_id, m["id"], [])
+            r = c.invoke_object_method(obj, thread, def_cls, method_id, [])
             val = r["value"]
             if r["exception"]:
                 out[inv["label"]] = {"error": "threw", "exc_id": r["exception"]}

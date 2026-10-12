@@ -56,6 +56,9 @@ class DebugSession:
         """Handshake, with escalating recovery: plain -> adb reconnect ->
         adb kill-server (stale jdwp state survives unclean debugger
         disconnects; observed on MIUI)."""
+        # request IDs and type IDs are per-connection: drop stale state
+        self.bp_registry.clear()
+        self._sig_cache.clear()
         last: JdwpConnError | None = None
         for level in (None, "reconnect", "kill-server"):
             if level:
@@ -188,6 +191,17 @@ class DebugSession:
         meta = self.bp_registry.pop(request_id, None)
         return {"cleared": request_id, "was": meta}
 
+    def clear_request(self, request_id: int) -> dict:
+        """Clear an event request with the event kind it was registered
+        under (defaults to BREAKPOINT for untracked ids)."""
+        kind = self.bp_registry.get(request_id, {}).get("kind",
+                                                        EVK_BREAKPOINT)
+        def do(c: JdwpClient):
+            c.clear_event(kind, request_id)
+        self._op(do)
+        meta = self.bp_registry.pop(request_id, None)
+        return {"cleared": request_id, "kind": kind, "was": meta}
+
     def list_breakpoints(self) -> list[dict]:
         return list(self.bp_registry.values())
 
@@ -201,7 +215,9 @@ class DebugSession:
                 hit = self.bp_registry.get(e["request_id"])
                 if hit:
                     e["breakpoint"] = {k: hit[k] for k in
-                                       ("spec", "java_line", "smali", "method")}
+                                       ("spec", "java_line", "smali",
+                                        "method", "hook")
+                                       if k in hit}
         return ev
 
     def _sig_of(self, type_id: int) -> str:
@@ -317,8 +333,8 @@ class DebugSession:
         def do(c: JdwpClient):
             _, type_id = c.object_reftype(obj)
             try:
-                def_cls, method_id = c.find_method(type_id, method,
-                                                   sig or None)
+                def_cls, method_id = c.resolve_instance_method(
+                    type_id, method, sig or None)
             except JdwpError as e:
                 raise ResolveError(str(e))
             encoded = []

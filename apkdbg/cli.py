@@ -125,6 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--duration", type=float, default=60.0)
     sp.add_argument("--hooks", help="comma-separated hook names")
     sp.add_argument("--returns", action="store_true")
+    sp.add_argument("--max-events", type=int, default=1000)
+    sp.add_argument("--max-bytes", type=int, default=1 << 20)
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("coverage", help="branch/method coverage")
