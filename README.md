@@ -263,9 +263,15 @@ to re-install them and get the NEW request ids.
 
 **ART JDWP quirks (handled internally, listed for reference):**
 
-- *Tagged exception field (Android 15+).* The spec says invoke replies carry
-  an untagged exception objectID; Android 15's JVMTI-based JDWP agent emits it
-  as a tagged value (`'L' + id`). The client parses both forms.
+- *Tagged exception field.* An invoke reply's exception object is a
+  **tagged** object ID (`tag + objectID`) — this is the *standard* JDWP reply
+  layout for `ObjectReference.InvokeMethod` and `ClassType.NewInstance`
+  ([JDWP specification](https://docs.oracle.com/javase/8/docs/technotes/guides/jpda/jdwp-spec.html)),
+  not an ART deviation. The client decodes the tagged form per spec and
+  additionally tolerates a bare untagged objectID from non-conforming
+  agents. Regression fixture: `tests/fixtures/jdwp/`
+  (`invoke_reply_tagged_exception.hex`, a standard reply carrying a tagged
+  non-null exception).
 - *InvokeMethod opcode.* On Android 10+ JDWP runs as a JVMTI agent; the
   spec-correct ObjectReference.InvokeMethod command is **6**. Sending the old
   cmd 9 gets a 1-byte error-style reply.
