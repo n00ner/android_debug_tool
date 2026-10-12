@@ -215,6 +215,26 @@ CREATE TABLE IF NOT EXISTS alias_decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_alias_decisions_cand
   ON alias_decisions(candidate_id);
+
+-- runtime artifacts recovered during debugging (issue #28): validated DEX
+-- payloads discovered at loading/decryption boundaries. Observation data
+-- only, keyed by content hash — additive to the static index, which is
+-- never replaced or merged with runtime content; carried across
+-- re-indexing like the other observation tables.
+CREATE TABLE IF NOT EXISTS runtime_artifacts (
+  artifact_key     TEXT PRIMARY KEY,  -- content sha256 (dedupe identity)
+  kind             TEXT NOT NULL,     -- dex | ...
+  sha256           TEXT NOT NULL,
+  file_size        INTEGER,
+  path             TEXT,              -- host-side exported file
+  origin           TEXT,              -- JSON: run/event/artifact, boundary, epoch
+  validation       TEXT,              -- JSON full-validation summary
+  apk_sha256       TEXT,              -- project APK identity (context only)
+  index_generation INTEGER NOT NULL,
+  first_seen       TEXT NOT NULL,
+  observations     INTEGER NOT NULL DEFAULT 1,
+  last_seen        TEXT NOT NULL
+);
 """
 
 

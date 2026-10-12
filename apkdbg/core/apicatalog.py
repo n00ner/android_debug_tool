@@ -409,6 +409,64 @@ _META: dict[str, dict] = {
                    "b": "artifact id (or run id with one snapshot)",
                    "force": "compare despite incompatibilities"},
     },
+    "unpack": {
+        "summary": "EXPERIMENTAL runtime DEX payload discovery at selected "
+                   "loading/decryption boundaries (issue #28) — NOT a "
+                   "universal unpacker: native payloads, unsupported "
+                   "loaders, split writes, and never-stable buffers "
+                   "produce capability/partial outcomes, never fake "
+                   "success",
+        "result": "observation records with DISTINCT outcomes (validated "
+                  "| candidate | invalid | truncated | incomplete | "
+                  "unsupported | not_dex | empty | path_evidence), "
+                  "outcome counts, budget/stop reason, dedup-by-hash "
+                  "metadata; artifacts on disk with JSON sidecars, never "
+                  "inlined into records; with record also run_id, with "
+                  "index also runtime_artifacts registrations",
+        "mutates": True, "idempotent": False, "retryable": False,
+        "project": True, "session": True,
+        "params": {"duration": "watch window in seconds",
+                   "boundaries": "in_memory_dex_class_loader (default) | "
+                                 "dex_class_loader_path | explicit hook "
+                                 "names",
+                   "cipher_overloads": "EXPLICIT opt-in Cipher.doFinal "
+                                       "overloads to observe, e.g. "
+                                       "[\"Cipher.doFinal(byte[])\"]",
+                   "defer": "CLASS_PREPARE-watch pending boundaries and "
+                            "auto-install when their class loads",
+                   "max_events": "safety bound on observation records",
+                   "max_candidates": "safety bound on candidate exports "
+                                     "per run",
+                   "max_candidate_bytes": "per-candidate size bound; "
+                                          "larger candidates stay "
+                                          "magic-validated candidates, "
+                                          "never exported",
+                   "max_run_bytes": "per-run exported-bytes budget",
+                   "prefix_bytes": "bounded prefix read before any "
+                                   "export (default 4096)",
+                   "export_dir": "artifact destination (default "
+                                 "<project>/exports)",
+                   "record": "persist the watch as a run manifest",
+                   "scenario": "scenario label for the run",
+                   "index": "register each validated artifact into "
+                            "runtime_artifacts (additive, hash+origin "
+                            "preserved)"},
+    },
+    "unpack_index": {
+        "summary": "register validated runtime DEX artifacts as "
+                   "additional project artifacts (issue #28 follow-up "
+                   "via the #35 observation-table path): list | index — "
+                   "hash + origin preserved, the original APK index is "
+                   "never silently replaced",
+        "result": "list: bounded page with count/total/limit/offset/"
+                  "truncated; index: registration row keyed by content "
+                  "hash (repeat registrations increment observations)",
+        "mutates": True, "idempotent": True, "retryable": True,
+        "project": True, "session": False, "pagination": True,
+        "params": {"action": "list | index",
+                   "artifact_id": "unpack_dex artifact id from a recorded "
+                                  "unpack run (action=index)"},
+    },
     "aliases": {
         "summary": "review runtime alias candidates (issue #25): list | "
                    "get | accept | reject | revise | add | export — stored "
@@ -498,7 +556,7 @@ _META: dict[str, dict] = {
         "project": True, "session": True,
         "params": {"command": "job-capable command: hook_crypto | "
                               "watch_strings | watch_framework | coverage | "
-                              "export_buffer",
+                              "export_buffer | unpack",
                    "params": "params object for that command, validated "
                              "against its catalog schema before queuing",
                    "max_records": "bounded record buffer size; oldest "

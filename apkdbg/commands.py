@@ -17,6 +17,7 @@ from .debug.coverage import CoverageTracker
 from .debug.hooks import crypto as crypto_hooks
 from .debug.hooks import framework as framework_hooks
 from .debug.hooks import strings as string_hooks
+from .debug import unpack as unpack_hooks
 from .debug.session import DebugSession
 from .debug.snapdiff import snapshot_diff
 from .debug.snapshot import Budgets, Snapshotter
@@ -554,6 +555,81 @@ def _export_buffer(ctx: Ctx, obj: int, epoch: int, source: str = "auto",
     return res
 
 
+# ------------------------------------------------- runtime DEX discovery (issue #28)
+def cmd_unpack(ctx: Ctx, duration: float = 60.0,
+               boundaries: list | None = None,
+               cipher_overloads: list | None = None,
+               defer: bool = False,
+               max_events: int = 200,
+               max_candidates: int = 25,
+               max_candidate_bytes: int = 16 << 20,
+               max_run_bytes: int = 64 << 20,
+               prefix_bytes: int = 4096,
+               export_dir: str | None = None,
+               record: bool = False, scenario: str | None = None,
+               index: bool = False) -> dict:
+    """Discover and validate runtime DEX payloads at selected loading/
+    decryption boundaries (experimental; NOT a universal unpacker).
+    boundaries: in_memory_dex_class_loader (default) | dex_class_loader_path
+    | hook names; Cipher.doFinal is observed only for explicitly selected
+    cipher_overloads. Outcomes are distinct: validated | candidate |
+    invalid | truncated | incomplete | unsupported | not_dex | empty |
+    path_evidence — capability/limits are never reported as dumps."""
+    return unpack_hooks.run_watch(
+        ctx.session, duration_s=duration, boundaries=boundaries,
+        cipher_overloads=cipher_overloads, defer=defer,
+        max_events=max_events, max_candidates=max_candidates,
+        max_candidate_bytes=max_candidate_bytes,
+        max_run_bytes=max_run_bytes, prefix_bytes=prefix_bytes,
+        export_dir=export_dir, record=record, scenario=scenario,
+        index=index)
+
+
+def cmd_unpack_index(ctx: Ctx, action: str = "list",
+                     artifact_id: str | None = None,
+                     limit: int = 50, offset: int = 0) -> dict:
+    """Follow-up registration of validated runtime DEX artifacts into the
+    project's runtime_artifacts table (issue #35 path: additive
+    observation rows preserving hash + origin; the original APK static
+    index is never replaced). action: list | index (needs artifact_id of
+    an "unpack_dex" artifact from a recorded unpack run)."""
+    if action == "list":
+        limit, offset = _page(limit, offset)
+        return unpack_hooks.list_artifacts(ctx.project,
+                                           limit=limit, offset=offset)
+    if action == "index":
+        if not artifact_id:
+            raise SessionError("unpack_index index needs an artifact_id",
+                               hint="see the artifacts of an unpack run "
+                                    "(`runs get <run_id>`)")
+        store = RunStore(ctx.project)
+        art = store.get_artifact(artifact_id)
+        if art["kind"] != "unpack_dex":
+            raise SessionError(
+                f"artifact {artifact_id} is {art['kind']!r}, not an "
+                "unpack_dex artifact",
+                hint="only validated runtime DEX artifacts can be "
+                     "registered")
+        body = art["body"]
+        if body.get("outcome") != "validated":
+            raise SessionError(
+                f"artifact {artifact_id} has outcome "
+                f"{body.get('outcome')!r}, not 'validated'",
+                hint="candidate/invalid/truncated captures are never "
+                     "registered as recovered artifacts")
+        return unpack_hooks.register_artifact(
+            ctx.project, sha256=body["sha256"], path=body["file"],
+            kind="dex",
+            origin={"run_id": art["run_id"], "artifact_id": artifact_id,
+                    "parent_event_id": art.get("parent_event_id"),
+                    "boundary": body.get("boundary"),
+                    "hook": body.get("hook"), "epoch": art.get("epoch")},
+            validation=body.get("validation") or {},
+            file_size=body.get("captured") or 0)
+    raise SessionError(f"unknown unpack_index action {action!r}",
+                       hint="list | index")
+
+
 # -------------------------------------------------------- aliases (issue #25)
 def cmd_aliases(ctx: Ctx, action: str = "list",
                 candidate_id: str | None = None,
@@ -698,12 +774,31 @@ def _job_export_buffer(ctx: Ctx, job) -> dict:
     return _export_buffer(ctx, cancel=job.cancel_event, **job.params)
 
 
+def _job_unpack(ctx: Ctx, job) -> dict:
+    p = job.params
+    return unpack_hooks.run_watch(
+        ctx.session, duration_s=p.get("duration", 60.0),
+        boundaries=p.get("boundaries"),
+        cipher_overloads=p.get("cipher_overloads"),
+        defer=p.get("defer", False),
+        max_events=p.get("max_events", 200),
+        max_candidates=p.get("max_candidates", 25),
+        max_candidate_bytes=p.get("max_candidate_bytes", 16 << 20),
+        max_run_bytes=p.get("max_run_bytes", 64 << 20),
+        prefix_bytes=p.get("prefix_bytes", 4096),
+        export_dir=p.get("export_dir"),
+        record=p.get("record", False), scenario=p.get("scenario"),
+        index=p.get("index", False),
+        cancel=job.cancel_event, on_record=job.emit)
+
+
 _JOB_RUNNERS = {
     "hook_crypto": _job_hook_crypto,
     "watch_strings": _job_watch_strings,
     "watch_framework": _job_watch_framework,
     "coverage": _job_coverage,
     "export_buffer": _job_export_buffer,
+    "unpack": _job_unpack,
 }
 
 # job control commands: answered from registry state only (never touch the
@@ -790,6 +885,8 @@ COMMANDS = {
     "runs": cmd_runs,
     "snapshot_diff": cmd_snapshot_diff,
     "export_buffer": cmd_export_buffer,
+    "unpack": cmd_unpack,
+    "unpack_index": cmd_unpack_index,
     "aliases": cmd_aliases,
     "native": cmd_native,
     "job_start": cmd_job_start,

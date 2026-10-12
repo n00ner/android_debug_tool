@@ -40,11 +40,13 @@ from . import manifests
 from .database import INDEX_VERSION, MappingDB
 from .project import Project, _remove_db_files, _remove_sidecars
 
-# historical runtime observations (issue #36) and reviewable alias
-# candidates (issue #25): retained across re-indexing, copied into each
-# published generation with their original generation ids
+# historical runtime observations (issue #36), reviewable alias
+# candidates (issue #25), and recovered runtime artifacts (issue #28):
+# retained across re-indexing, copied into each published generation with
+# their original generation ids
 OBSERVATION_TABLES = ("runs", "events", "artifacts", "coverage_hits",
-                      "alias_candidates", "alias_decisions")
+                      "alias_candidates", "alias_decisions",
+                      "runtime_artifacts")
 
 
 def run_init(apk: str | Path, project_root: str | Path, *,
