@@ -129,13 +129,18 @@ class Adb:
 
     def reconnect(self) -> None:
         """Recover from stale adbd/host state (e.g. a previous debugger
-        detached uncleanly and the VM refuses new JDWP handshakes)."""
+        detached uncleanly and the VM refuses new JDWP handshakes).
+        Scoped to this instance's selected device (`adb -s <serial>
+        reconnect`) — never a global server restart."""
         self.sh("reconnect", check=False, timeout=20)
 
     def kill_server(self) -> None:
-        """Last-resort recovery: restart the host adb daemon. Clears stale
-        jdwp-forward bookkeeping that survives `adb reconnect` (observed on
-        MIUI/adbd 1.0.41)."""
+        """Last-resort recovery: restart the host adb daemon. GLOBAL —
+        every attached device and debug session is affected, so the
+        session layer calls this only on explicit user request
+        (connect(recovery="kill-server")), never as a silent fallback.
+        Clears stale jdwp-forward bookkeeping that survives
+        `adb reconnect` (observed on MIUI/adbd 1.0.41)."""
         run([self.bin, "kill-server"], timeout=15, tool="adb", check=False)
 
     def push(self, local: str, remote: str, timeout: int = 120) -> None:

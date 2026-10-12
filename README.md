@@ -65,7 +65,7 @@ Key design decisions:
 ## Command surface
 
 Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`.
-Session (use `serve` mode for multi-step): `connect`, `bp`, `bp_del`,
+Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
 `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
 `snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`, `native`.
 
@@ -173,11 +173,25 @@ export APKDBG_ADB="C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.e
 "$APKDBG_ADB" kill-server && "$APKDBG_ADB" start-server
 ```
 
-**adb in a bad state mid-session.** apkdbg's connect path already walks a
-recovery ladder (`get-state` probe → `reconnect` → `kill-server`/`start-server`
-→ relaunch), but if you run adb by hand: `adb kill-server`, replug or
-`adb reconnect`, verify with `adb devices -l` and `adb shell pidof <pkg>`
-before retrying.
+**adb in a bad state mid-session.** apkdbg keeps recovery scoped to the
+affected session: a dropped JDWP transport rebuilds only that session's
+own forward listener and (at most) runs `adb reconnect` for the selected
+device — other sessions' forwards and the global adb server are never
+touched. A global server restart happens only when explicitly requested
+(`connect` with `recovery="kill-server"`). If you run adb by hand:
+`adb kill-server`, replug or `adb reconnect`, verify with
+`adb devices -l` and `adb shell pidof <pkg>` before retrying.
+
+**Connection dropped mid-operation.** State-changing ops (invoke,
+write_var, resume, step) are never transparently replayed: if the request
+may have reached the VM before the drop, the caller gets a structured
+`E_OUTCOME_UNKNOWN` error (execution is *unknown*, not failed) carrying
+the op name, connection epoch, and recovery state. Read-only ops retry
+once after the scoped reconnect, except ops taking numeric thread/frame
+ids — those fail with an actionable `E_STALE_HANDLE` error instead of
+reading a reused id. Breakpoint/hook definitions survive as symbolic
+defs: run `restore` after a reconnect (or a process restart + `connect`)
+to re-install them and get the NEW request ids.
 
 **ART JDWP quirks (handled internally, listed for reference):**
 

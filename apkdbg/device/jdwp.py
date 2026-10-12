@@ -95,6 +95,19 @@ SIG_TO_TAG = {"B": 66, "Z": 90, "C": 67, "S": 83, "F": 70, "D": 68,
 
 
 class JdwpConnError(JdwpError):
+    """Transport-level failure. `context["phase"]` (set by request()) says
+    where the fault struck, which the session's recovery policy branches on
+    (issue #32):
+      pre-dispatch — dead connection detected before send: the command was
+                     provably never transmitted; replaying cannot duplicate
+                     a VM-side effect;
+      transmit     — sendall failed: a partial packet may have reached the
+                     VM; a state-changing command may have executed;
+      post-send    — the command was fully sent but the reply never arrived
+                     (timeout or connection drop while waiting): the VM may
+                     have executed it. Uncertain for mutations.
+    Untagged errors (handshake, reader loop, next_event) carry no phase and
+    must be treated conservatively as post-send."""
     code = "E_JDWP_CONN"
 
 
@@ -377,7 +390,8 @@ class JdwpClient:
     def request(self, cmdset: int, cmd: int, payload: bytes = b"",
                 timeout: float | None = None) -> Reader:
         if self._dead:
-            raise JdwpConnError(f"JDWP connection is dead: {self._dead}")
+            raise JdwpConnError(f"JDWP connection is dead: {self._dead}",
+                                phase="pre-dispatch")
         pid = self._alloc_id()
         slot = {"event": threading.Event(), "error": None, "data": b""}
         with self._send_lock:
@@ -387,12 +401,16 @@ class JdwpClient:
                 self.sock.sendall(pkt + payload)
             except OSError as e:
                 self._pending.pop(pid, None)
-                raise JdwpConnError(f"JDWP send failed: {e}") from e
+                raise JdwpConnError(f"JDWP send failed: {e}",
+                                    phase="transmit") from e
         if not slot["event"].wait(timeout or self.timeout):
             self._pending.pop(pid, None)
-            raise JdwpConnError(f"JDWP reply timeout cmdset={cmdset} cmd={cmd}")
+            raise JdwpConnError(
+                f"JDWP reply timeout cmdset={cmdset} cmd={cmd}",
+                phase="post-send")
         if slot["error"] == -1:
-            raise JdwpConnError(f"JDWP connection lost: {self._dead}")
+            raise JdwpConnError(f"JDWP connection lost: {self._dead}",
+                                phase="post-send")
         if slot["error"]:
             raise JdwpReplyError(slot["error"], cmdset, cmd)
         return Reader(slot["data"], self.sizes)

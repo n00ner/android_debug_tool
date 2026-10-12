@@ -1,8 +1,36 @@
 """DebugSession — owns ADB + JDWP connection lifecycle and all runtime ops.
 
-Robustness policy: every public op goes through _op(), which on a broken
-JDWP socket re-establishes forwarding + handshake once before giving up.
-ADB-level failures raise AdbError with the tool's stderr as the hint.
+Recovery policy (issue #32): every public op goes through _op() with an
+explicit safety class:
+
+  read        no VM-side effects. Ops that re-derive their inputs from
+              symbolic state on every attempt (wait_events) RETRY once
+              after a scoped reconnect. Ops taking numeric handles
+              (read_var's thread/frame ids, _sig_of's type id) NEVER
+              auto-retry across an epoch: the new connection may reuse the
+              id for an unrelated object, so the caller gets an actionable
+              StaleHandleError instead of data from the wrong target.
+  idempotent  the mutation dies with the connection (JDWP event requests
+              are cleared when the transport breaks), so a post-reconnect
+              replay cannot duplicate an effect — set_breakpoint and
+              clear_request retry once.
+  state       invoke, write_var, resume, vm_resume, step. When the fault
+              could have occurred after the command reached the VM (fault
+              phase transmit/post-send) the op is NEVER replayed: the
+              caller gets OutcomeUnknownError (outcome "unknown") carrying
+              the op name, connection epoch, and recovery state. Only a
+              pre-dispatch fault (dead socket detected before send) is
+              replayed, since the command provably never left the host.
+
+Op call sites pass _class=/_name=/_reresolve= to _op(); the defaults
+(read, no re-resolve) are the conservative choice.
+
+Recovery is SCOPED to this session: a failed op rebuilds only this
+session's forward listener and (at most) `adb reconnect`s this device.
+Another session's forward and the global adb server are never touched;
+kill-server runs only when connect(recovery="kill-server") explicitly
+opted in. A pid change is not a transport failure: ProcessDiedError
+tells the caller a full re-attach plus restore is required.
 
 Event ownership lives in the per-session EventDispatcher (session.events,
 see debug/dispatcher.py): request ids are registered with an owner, event
@@ -24,12 +52,18 @@ from ..device.jdwp import (
     STEP_INTO, STEP_LINE, STEP_OUT, STEP_OVER,
     JdwpClient, JdwpConnError, JdwpError, sig_to_tag, TAG_STRING,
 )
-from ..errors import ResolveError, SessionError
+from ..errors import (
+    OutcomeUnknownError, ProcessDiedError, ResolveError, SessionError,
+    StaleHandleError,
+)
 from ..protocol import log_progress
 from . import translate
 from .dispatcher import EventDispatcher
 
 STEP_KINDS = {"into": STEP_INTO, "over": STEP_OVER, "out": STEP_OUT}
+
+# op safety classes for _op() (issue #32)
+OP_READ, OP_IDEMPOTENT, OP_STATE = "read", "idempotent", "state"
 
 
 class DebugSession:
@@ -54,7 +88,18 @@ class DebugSession:
 
     # ------------------------------------------------------------------ conn
     def connect(self, package: str, *, launch: bool = False,
-                activity: str | None = None, timeout: int = 30) -> dict:
+                activity: str | None = None, timeout: int = 30,
+                recovery: str | None = None) -> dict:
+        """recovery: explicit escalation policy. Default (None) keeps
+        recovery scoped to this session — our own forward listener plus
+        `adb reconnect` for this device only. "kill-server" additionally
+        allows a global adb server restart as a last resort; it affects
+        every attached device and debug session, so it must be requested
+        explicitly and is never a silent fallback."""
+        if recovery not in (None, "kill-server"):
+            raise SessionError(f"unknown recovery policy {recovery!r}",
+                               hint="omit it, or pass "
+                                    "recovery='kill-server'")
         self.adb.ensure_device()
         if launch:
             self.adb.force_stop(package)
@@ -62,22 +107,28 @@ class DebugSession:
         pid = self.adb.wait_pid(package, timeout=timeout)
         port = self.adb.forward_jdwp(pid)
         self.pkg, self.pid, self.port = package, pid, port
-        self._attach()
+        self._attach(allow_global_restart=recovery == "kill-server")
         return {"package": package, "pid": pid, "port": port,
                 "vm": self.client.handshake_info.get("vm_name"),
                 "jdwp": f"{self.client.handshake_info.get('jdwp_major')}."
                         f"{self.client.handshake_info.get('jdwp_minor')}"}
 
-    def _attach(self) -> None:
-        """Handshake, with escalating recovery: plain -> adb reconnect ->
-        adb kill-server (stale jdwp state survives unclean debugger
-        disconnects; observed on MIUI)."""
+    def _attach(self, *, allow_global_restart: bool = False) -> None:
+        """Handshake with SCOPED recovery: plain re-attach, then `adb
+        reconnect` for this device plus a rebuild of this session's own
+        forward listener (stale jdwp state survives unclean debugger
+        disconnects; observed on MIUI). Other sessions' forwards are never
+        removed, and the global adb server is never restarted unless the
+        caller explicitly opted in (connect(recovery="kill-server"))."""
         # request IDs and type IDs are per-connection: drop stale state
         self.bp_registry.clear()
         self._sig_cache.clear()
         self.events.bump_epoch()
         last: JdwpConnError | None = None
-        for level in (None, "reconnect", "kill-server"):
+        levels = [None, "reconnect"]
+        if allow_global_restart:
+            levels.append("kill-server")
+        for level in levels:
             if level:
                 log_progress(f"JDWP attach recovery: {level}")
                 getattr(self.adb, level.replace("-", "_"))()
@@ -94,24 +145,64 @@ class DebugSession:
                 last = e
         raise last
 
-    def _op(self, fn: Callable, *args, **kwargs):
-        """Run fn(self.client, ...) with one transparent reconnect retry."""
+    def _op(self, fn: Callable, *args, _class: str = OP_READ,
+            _name: str | None = None, _reresolve: bool = False, **kwargs):
+        """Run fn(self.client, ...) under the class-based recovery policy
+        documented in the module docstring. _name names the op in
+        structured errors; _reresolve marks a read whose inputs are fully
+        re-derived from symbolic state on every attempt (only then is a
+        read retried across an epoch boundary)."""
         try:
             return fn(self.client, *args, **kwargs)
-        except JdwpConnError:
-            log_progress("JDWP connection lost; attempting reconnect")
-            if not self.pid:
-                raise
+        except JdwpConnError as e:
+            return self._recover_op(e, fn, args, kwargs,
+                                    _class, _name, _reresolve)
+
+    def _recover_op(self, err: JdwpConnError, fn: Callable, args, kwargs,
+                    op_class: str, name: str | None, reresolve: bool):
+        op = name or getattr(fn, "__name__", "op")
+        # untagged conn errors are treated as post-send (conservative)
+        phase = err.context.get("phase") or "post-send"
+        epoch_before = self.events.epoch
+        # Process restart is NOT a transport failure (issue #32): every
+        # handle, frame, and event request is gone — reconnecting the old
+        # forward would debug a different process incarnation.
+        if self.pid:
             pid = self.adb.pidof(self.pkg)
-            if pid != self.pid:  # process restarted -> full re-attach
-                raise SessionError(
+            if pid != self.pid:
+                raise ProcessDiedError(
                     f"target process died (pid {self.pid} -> {pid})",
-                    hint="re-run connect; breakpoints must be re-registered")
-            # release our own listener first: forward_jdwp uses --no-rebind
-            self.adb.remove_forward(self.port)
-            self.adb.forward_jdwp(self.pid, self.port)
-            self._attach()
-            return fn(self.client, *args, **kwargs)
+                    op=op, epoch=epoch_before,
+                    pid_old=self.pid, pid_new=pid) from err
+        # Scoped recovery: only this session's forward listener is rebuilt.
+        recovery = "not attempted (no live target)"
+        if self.pid:
+            try:
+                log_progress("JDWP connection lost; scoped reconnect")
+                self.adb.remove_forward(self.port)
+                self.adb.forward_jdwp(self.pid, self.port)
+                self._attach()
+                recovery = (f"reconnected (epoch {epoch_before} -> "
+                            f"{self.events.epoch})")
+            except JdwpConnError as rec:
+                recovery = f"reconnect failed: {rec}"
+        # A state-changing op whose command may have reached the VM is
+        # never replayed — report UNKNOWN instead of guessing either way.
+        uncertain = op_class == OP_STATE and phase != "pre-dispatch"
+        if uncertain:
+            raise OutcomeUnknownError(
+                op, phase=phase, epoch=epoch_before,
+                epoch_new=self.events.epoch
+                if recovery.startswith("reconnected") else None,
+                recovery=recovery) from err
+        if not recovery.startswith("reconnected"):
+            raise err
+        if op_class == OP_READ and not reresolve:
+            # numeric handles died with the old epoch even when nothing
+            # was sent; replaying could address an unrelated object whose
+            # id the new connection reused
+            raise StaleHandleError(op, epoch=epoch_before) from err
+        return fn(self.client, *args, **kwargs)
 
     def close(self) -> None:
         if self.client:
@@ -134,7 +225,17 @@ class DebugSession:
         """
         with self.project.db() as db:
             res = translate.resolve(db, spec)
+        placed = self._place(res, spec, suspend_all)
+        return {"resolved": res, "breakpoints": placed}
 
+    def _place(self, res: dict, spec: str, suspend_all: bool) -> list[dict]:
+        """Resolve a translated spec against the CURRENT connection
+        (loaded classes, method ids, LineNumberTable) and install the
+        breakpoint request(s). Op class "idempotent": JDWP event requests
+        die with the connection, so a post-reconnect replay of a
+        half-finished placement cannot duplicate a request. Used by
+        set_breakpoint and by restore_requests (which re-runs it from the
+        symbolic definition)."""
         def do(c: JdwpClient):
             classes = c.classes_by_signature(res["sig"])
             if not classes:
@@ -164,6 +265,8 @@ class DebugSession:
                             "bytecode_index": idx, "spec": spec,
                             "smali": res["smali"],
                             "owner": "user", "kind": EVK_BREAKPOINT,
+                            "suspend_policy": SP_ALL if suspend_all
+                            else SP_EVENT_THREAD,
                             "entry": "source"}
                     self.events.register(rid, meta)
                     placed.append(meta)
@@ -174,7 +277,9 @@ class DebugSession:
                     f"for dalvik line {res['dalvik_line']})",
                     hint="adjacent lines: " + self._nearby_lines(res))
             return placed
-        return {"resolved": res, "breakpoints": self._op(do)}
+        placed = self._op(do, _class=OP_IDEMPOTENT, _name="set_breakpoint")
+        self.events.define_source(spec, res, suspend_all)
+        return placed
 
     def _nearby_lines(self, res: dict) -> str:
         with self.project.db() as db:
@@ -207,13 +312,82 @@ class DebugSession:
                             "connection epoch; remote state left untouched"}
         def do(c: JdwpClient):
             c.clear_event(kind, request_id)
-        self._op(do)
+        self._op(do, _class=OP_IDEMPOTENT, _name="clear_request")
         was = self.events.unregister(request_id)
         return {"cleared": request_id, "kind": kind, "was": was,
                 "status": "confirmed"}
 
     def list_breakpoints(self) -> list[dict]:
         return list(self.bp_registry.values())
+
+    # ---------------------------------------------------------------- restore
+    def restore_requests(self, *, defer: bool = True) -> dict:
+        """Re-install symbolic breakpoint/hook definitions on the CURRENT
+        connection (issue #32): call after a fresh attach, a reconnect, or
+        a process restart + connect. Old request ids are never revived —
+        every installed item reports its NEW request ids. Items already
+        live in this epoch keep their ids (already_live=True). "pending"
+        means the target class is not loaded right now (with defer=True,
+        hooks also get a CLASS_PREPARE watch that auto-installs on load);
+        "failed" means the definition no longer resolves."""
+        from .hooks import crypto as crypto_hooks
+        installed, pending, failed, deferred = [], [], [], []
+        for d in self.events.symbolic_hooks():
+            if d.get("entry") == "source":
+                self._restore_source(d, installed, pending, failed)
+            else:
+                self._restore_hook(d, crypto_hooks, defer,
+                                   installed, pending, failed, deferred)
+        return {"epoch": self.events.epoch,
+                "installed": installed, "pending": pending,
+                "failed": failed, "deferred": deferred,
+                "note": "request_ids are new current-epoch ids; ids from "
+                        "before the reconnect are dead and never revived"}
+
+    def _restore_source(self, d: dict, installed, pending, failed) -> None:
+        spec = d["spec"]
+        live = [m for m in self.bp_registry.values()
+                if m.get("entry") == "source" and m.get("spec") == spec
+                and self.events.is_live(m)]
+        if live:
+            installed.append({"kind": "source", "spec": spec,
+                              "already_live": True,
+                              "request_ids": [m["request_id"] for m in live]})
+            return
+        suspend_all = d.get("suspend_policy", SP_ALL) == SP_ALL
+        try:
+            metas = self._place(d["resolved"], spec, suspend_all)
+            installed.append({"kind": "source", "spec": spec,
+                              "request_ids": [m["request_id"]
+                                              for m in metas]})
+        except ResolveError as e:
+            item = {"kind": "source", "spec": spec,
+                    "reason": str(e)[:160]}
+            (pending if str(e).startswith("class not loaded")
+             else failed).append(item)
+        except Exception as e:
+            failed.append({"kind": "source", "spec": spec,
+                           "reason": str(e)[:160]})
+
+    def _restore_hook(self, d: dict, crypto_hooks, defer: bool,
+                      installed, pending, failed, deferred) -> None:
+        name = d.get("hook")
+        try:
+            rep = crypto_hooks.install(
+                self, names=[name],
+                capture_returns=d.get("capture_returns", False), defer=defer)
+        except Exception as e:
+            failed.append({"kind": "hook", "hook": name,
+                           "reason": str(e)[:160]})
+            return
+        for i in rep["installed"]:
+            installed.append({"kind": "hook", "hook": i["hook"],
+                              "request_ids": i["request_ids"]})
+        for p in rep["pending"]:
+            item = {"kind": "hook", "hook": p["hook"],
+                    "reason": p["reason"]}
+            (pending if p["state"] == "pending" else failed).append(item)
+        deferred.extend(rep["deferred"])
 
     # ----------------------------------------------------------------- events
     def wait_events(self, timeout: float = 60.0) -> dict:
@@ -248,16 +422,22 @@ class DebugSession:
 
     def _sig_of(self, type_id: int) -> str:
         if type_id not in self._sig_cache:
+            # numeric type id: not re-resolvable across an epoch — a
+            # reconnect surfaces StaleHandleError, never a wrong-class sig
             self._sig_cache[type_id] = self._op(
-                lambda c: c.rt_signature(type_id))
+                lambda c: c.rt_signature(type_id), _name="sig_of")
         return self._sig_cache[type_id]
 
     # ---------------------------------------------------------------- control
     def resume(self, thread: int | None = None) -> dict:
+        # state-changing: a lost reply means the suspension state is
+        # UNKNOWN — never transparently replayed (issue #32)
         if thread:
-            self._op(lambda c: c.thread_resume(thread))
+            self._op(lambda c: c.thread_resume(thread),
+                     _class=OP_STATE, _name="resume(thread)")
             return {"resumed": "thread", "thread": thread}
-        self._op(lambda c: c.vm_resume())
+        self._op(lambda c: c.vm_resume(),
+                 _class=OP_STATE, _name="resume(vm)")
         return {"resumed": "vm"}
 
     def step(self, thread: int, kind: str = "over",
@@ -274,9 +454,12 @@ class DebugSession:
                 c.thread_resume(thread)
                 ev = c.next_event(timeout)
             finally:
-                c.clear_event(EVK_SINGLE_STEP, rid)
+                try:
+                    c.clear_event(EVK_SINGLE_STEP, rid)
+                except JdwpConnError:
+                    pass  # never mask the original fault phase (issue #32)
             return ev
-        return self._op(do)
+        return self._op(do, _class=OP_STATE, _name="step")
 
     # ----------------------------------------------------------------- frames
     def _frame0(self, c: JdwpClient, thread: int, frame_idx: int = 0) -> dict:
@@ -324,7 +507,11 @@ class DebugSession:
             if v["tag"] == TAG_STRING and v["v"]:
                 out["string"] = c.string_value(v["v"])
             return out
-        return self._op(do)
+        # read-only, but thread/frame ids are numeric handles of the
+        # current epoch: after a reconnect the caller gets StaleHandleError
+        # and must re-acquire fresh ids — never a silent retry against
+        # reused ids (issue #32)
+        return self._op(do, _class=OP_READ, _name="read_var")
 
     def write_var(self, thread: int, value, *, name: str | None = None,
                   slot: int | None = None, frame: int = 0,
@@ -349,7 +536,7 @@ class DebugSession:
                 and tag == TAG_STRING else value
             c.frame_set_values(thread, fr["frame_id"], [(slot_n, tag, enc)])
             return {"slot": slot_n, "tag": tag, "written": value}
-        return self._op(do)
+        return self._op(do, _class=OP_STATE, _name="write_var")
 
     # ----------------------------------------------------------------- invoke
     def invoke(self, thread: int, obj: int, method: str, sig: str,
@@ -380,7 +567,10 @@ class DebugSession:
             if rv["tag"] == TAG_STRING and rv["v"]:
                 out["string"] = c.string_value(rv["v"])
             return out
-        return self._op(do)
+        # state-changing: if the reply is lost after the VM ran the
+        # method, a replay would execute app code twice — reported as
+        # OutcomeUnknownError instead (issue #32)
+        return self._op(do, _class=OP_STATE, _name="invoke")
 
 
 _TYPE_SIGS = {"int": "I", "long": "J", "boolean": "Z", "byte": "B",

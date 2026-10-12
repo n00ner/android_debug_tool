@@ -89,7 +89,20 @@ _META: dict[str, dict] = {
         "params": {"pkg": "package name; defaults to project state",
                    "launch": "force-start the app before attaching",
                    "activity": "activity to launch (default: launcher)",
-                   "timeout": "adb/JDWP attach timeout in seconds"},
+                   "timeout": "adb/JDWP attach timeout in seconds",
+                   "recovery": "escalation policy; omit for session-scoped "
+                               "recovery only, \"kill-server\" explicitly "
+                               "allows a global adb server restart"},
+    },
+    "restore": {
+        "summary": "re-install symbolic breakpoint/hook definitions after "
+                   "a reconnect or process restart (issue #32)",
+        "result": "{\"epoch\", installed (NEW request ids) / pending / "
+                  "failed / deferred}; old ids are never revived",
+        "mutates": True, "idempotent": True, "retryable": True,
+        "project": True, "session": True,
+        "params": {"defer": "also arm CLASS_PREPARE auto-install for "
+                            "hooks whose class is not loaded yet"},
     },
     "bp": {
         "summary": "set a breakpoint: com.foo.Class.method:42",

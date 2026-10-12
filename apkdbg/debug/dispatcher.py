@@ -8,9 +8,11 @@ explicit owner, event kind, and epoch stamp. Request ids and type ids are
 per-connection: DebugSession._attach calls bump_epoch(), which kills every
 live handle — subscriptions from an older epoch go inactive and lookups of
 stale-stamped entries fail, so two connection epochs (or two sessions) may
-reuse numeric request ids without cross-contamination. Symbolic hook
-definitions are retained across epochs (EventDispatcher.symbolic_hooks) for
-the re-install path after a reconnect; live request ids are not. Remote
+reuse numeric request ids without cross-contamination. Symbolic hook and
+source-breakpoint definitions are retained across epochs (symbolic_hooks,
+define_source) as the input of DebugSession.restore_requests(); live
+request ids are not, and an explicit clear of a definition's last live
+entry drops the definition so restore never resurrects it. Remote
 cleanup of a dead epoch is UNCONFIRMED by definition: never send a clear or
 claim a resume succeeded without transport confirmation.
 
@@ -51,9 +53,25 @@ registry entry when the VM answers ReferenceType.ClassLoader).
 from __future__ import annotations
 
 from ..device.jdwp import (
-    EVK_BREAKPOINT, EVK_CLASS_PREPARE, SP_EVENT_THREAD, SP_NONE,
+    EVK_BREAKPOINT, EVK_CLASS_PREPARE, SP_ALL, SP_EVENT_THREAD, SP_NONE,
 )
 from ..protocol import log_progress
+
+
+def _symbolic_key(meta: dict | None) -> tuple | None:
+    """Symbolic-definition key of a registry entry: hooks by (owner, hook
+    name), source breakpoints by ("user", spec), deferred CLASS_PREPARE
+    watches by (owner, deferred key). Entries without a symbolic def
+    (one-shot step requests) return None."""
+    if not meta:
+        return None
+    if meta.get("hook_def") is not None:
+        return (meta.get("owner"), meta.get("hook"))
+    if meta.get("entry") == "source" and meta.get("spec"):
+        return ("user", meta["spec"])
+    if meta.get("entry") == "deferred":
+        return (meta.get("owner"), meta.get("deferred"))
+    return None
 
 
 class SuspensionLease:
@@ -153,9 +171,28 @@ class EventDispatcher:
                 "capture_returns": not meta.get("can_invoke", True)}
         return meta
 
+    def define_source(self, spec: str, resolved: dict,
+                      suspend_all: bool) -> None:
+        """Record the symbolic definition of a source breakpoint (the
+        resolved translation is connection-independent: class signature,
+        dalvik line, method descriptors). It survives epoch bumps and is
+        the input of restore_requests(); live request ids never do."""
+        self._symbolic[("user", spec)] = {
+            "owner": "user", "entry": "source", "spec": spec,
+            "resolved": resolved,
+            "suspend_policy": SP_ALL if suspend_all else SP_EVENT_THREAD}
+
     def unregister(self, request_id: int) -> dict | None:
         self._deferred.pop(request_id, None)
-        return self.session.bp_registry.pop(request_id, None)
+        meta = self.session.bp_registry.pop(request_id, None)
+        key = _symbolic_key(meta)
+        if key is not None and not any(
+                _symbolic_key(m) == key
+                for m in self.session.bp_registry.values()):
+            # the last live entry of the definition was explicitly
+            # cleared: restore must not resurrect it
+            self._symbolic.pop(key, None)
+        return meta
 
     def is_live(self, meta: dict | None) -> bool:
         return meta is not None and meta.get("_epoch") in (None, self.epoch)
@@ -272,8 +309,12 @@ class EventDispatcher:
 
     def next_routed(self, timeout: float | None = None) -> RoutedResult:
         """Fetch one composite from the transport and route it. Never drains
-        the stash — that is the public wait_events path."""
-        comp = self.session._op(lambda c: c.next_event(timeout))
+        the stash — that is the public wait_events path. Read-only and
+        handle-free: after a scoped reconnect it may re-block on the new
+        connection's event stream (issue #32 op class "read", re-resolve)."""
+        comp = self.session._op(lambda c: c.next_event(timeout),
+                                _class="read", _name="wait_events",
+                                _reresolve=True)
         return self.dispatch(comp)
 
     # ---------------------------------------------------------------- stash
