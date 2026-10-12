@@ -305,6 +305,73 @@ _META: dict[str, dict] = {
                    "mode": "restrict to one capture mode (run config)",
                    "text": "substring match on captured text"},
     },
+    "watch_framework": {
+        "summary": "opt-in framework watcher profiles (issue #27): "
+                   "navigation requests, SharedPreferences staged edits / "
+                   "submissions, and system-service lookups at the hooked "
+                   "framework methods — observation points with explicit "
+                   "coverage notes, never full-coverage claims",
+        "result": "watcher records with attribution status and "
+                  "correlation ids, derived per-editor transaction view "
+                  "(discarded editors explicit), service lookup counts, "
+                  "received/filtered/matched/unavailable counts, stop "
+                  "reason, per-profile install states, coverage notes",
+        "mutates": True, "idempotent": False, "retryable": False,
+        "project": True, "session": True,
+        "params": {"duration": "watch window in seconds",
+                   "families": "profile families to enable: navigation | "
+                               "storage | services (default: all three)",
+                   "profiles": "builtin profile names, family names, "
+                               "and/or explicit {\"cls\",\"method\",\"sig\"} "
+                               "objects (overrides families)",
+                   "mode": "best_effort (SP_NONE, no attribution/args) | "
+                           "attributed (SP_EVENT_THREAD, args + bounded "
+                           "stack while suspended)",
+                   "scope": "app scope for attribution, JDWP class-match "
+                            "pattern, e.g. com.example.*",
+                   "exclude": "class-match patterns excluded from "
+                              "attribution (framework wrappers are never "
+                              "reported as app callers)",
+                   "invoke_getters": "EXPLICIT opt-in: invoke metadata "
+                                     "getters (Intent.getAction/"
+                                     "getComponent/...) on the suspended "
+                                     "thread — runs application code; "
+                                     "off by default",
+                   "corr_window_ms": "correlation window for one call "
+                                     "traversing several watched methods; "
+                                     "0 disables correlation",
+                   "max_events": "safety bound on emitted records",
+                   "max_reads": "safety bound on JDWP reads issued by "
+                                "extraction",
+                   "max_output_bytes": "safety bound on captured payload "
+                                       "bytes",
+                   "max_queue": "stop when unrelated stashed composites "
+                                "exceed this (queue pressure)",
+                   "max_stack": "stack depth bound for attribution",
+                   "max_str": "per-string length bound (longer strings "
+                              "are truncated and counted)",
+                   "thread": "restrict capture to this thread "
+                             "(request-level ThreadOnly modifier)",
+                   "mod_count": "MOD_COUNT=N: deliver ONE event after N-1 "
+                                "earlier matches are skipped — NOT a "
+                                "first-N budget",
+                   "defer": "CLASS_PREPARE-watch pending profiles and "
+                            "auto-install when their class loads",
+                   "record": "persist the watch as a run manifest",
+                   "scenario": "scenario label for the run"},
+    },
+    "framework_events": {
+        "summary": "offline query over persisted framework-watch records "
+                   "(issue #27)",
+        "result": "{\"records\": [...], count/total/limit/offset/truncated}",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False, "pagination": True,
+        "params": {"run_id": "restrict to one run",
+                   "family": "restrict to one profile family",
+                   "profile": "restrict to one source profile",
+                   "role": "restrict to one role: request | lifecycle | "
+                           "staged | submit | lookup"},
+    },
     "coverage": {
         "summary": "method- or line-level coverage for the given packages",
         "result": "hit tables with budget/truncation metadata",

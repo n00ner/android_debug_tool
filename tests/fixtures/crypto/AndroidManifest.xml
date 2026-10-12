@@ -6,6 +6,17 @@
     <application
         android:label="CryptoFixture"
         android:debuggable="true">
+        <activity
+            android:name=".FixtureActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".SecondActivity"
+            android:exported="false" />
         <receiver
             android:name=".RunReceiver"
             android:exported="true">
@@ -13,6 +24,9 @@
                 <action android:name="com.apkdbg.cryptofixture.RUN" />
                 <action android:name="com.apkdbg.cryptofixture.STRINGS" />
                 <action android:name="com.apkdbg.cryptofixture.BENCH" />
+                <action android:name="com.apkdbg.cryptofixture.FW_STORE" />
+                <action android:name="com.apkdbg.cryptofixture.FW_SVC" />
+                <action android:name="com.apkdbg.cryptofixture.FW_BENCH" />
             </intent-filter>
         </receiver>
     </application>
