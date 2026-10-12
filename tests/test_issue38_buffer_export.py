@@ -127,27 +127,39 @@ def make_array_client(data=CORPUS, oid=800):
 
 
 def make_buffer_client(layout="openjdk", position=4096, limit=61440,
-                       mark=100, buf_offset=0, buf_oid=900, arr_oid=800):
+                       mark=100, buf_offset=0, buf_oid=900, arr_oid=800,
+                       readonly=None):
     c, _ = make_array_client()
     if layout == "openjdk":
         c.obj_type[buf_oid] = (76, 3)
         c.sigs.update(SIGS_OPENJDK)
         c.supers.update(SUPERS_OPENJDK)
-        c.fields.update(FIELDS_OPENJDK)
+        c.fields.update({k: list(v) for k, v in FIELDS_OPENJDK.items()})
         ids = {"position": 11, "limit": 12, "mark": 13,
                "hb": 21, "offset": 22}
+        if readonly is not None:
+            # ART API 35 layout: isReadOnly flag on java.nio.ByteBuffer,
+            # plain HeapByteBuffer runtime class for read-only views
+            c.fields[2].append(F(24, "isReadOnly", "Z"))
+            ids["isReadOnly"] = 24
     else:
         c.obj_type[buf_oid] = (76, 6)
         c.sigs.update(SIGS_LIBCORE)
         c.supers.update(SUPERS_LIBCORE)
-        c.fields.update(FIELDS_LIBCORE)
+        c.fields.update({k: list(v) for k, v in FIELDS_LIBCORE.items()})
         ids = {"position": 51, "limit": 52, "mark": 53,
                "hb": 61, "offset": 62}
+        if readonly is not None:
+            c.fields[6].append(F(64, "readOnly", "Z"))
+            ids["readOnly"] = 64
     c.field_vals[(buf_oid, ids["position"])] = {"tag": 73, "v": position}
     c.field_vals[(buf_oid, ids["limit"])] = {"tag": 73, "v": limit}
     c.field_vals[(buf_oid, ids["mark"])] = {"tag": 73, "v": mark}
     c.field_vals[(buf_oid, ids["hb"])] = {"tag": 91, "v": arr_oid}
     c.field_vals[(buf_oid, ids["offset"])] = {"tag": 73, "v": buf_offset}
+    if readonly is not None:
+        key = "isReadOnly" if layout == "openjdk" else "readOnly"
+        c.field_vals[(buf_oid, ids[key])] = {"tag": 90, "v": readonly}
     return c, buf_oid, arr_oid
 
 
@@ -353,6 +365,35 @@ class ByteBufferExportTests(unittest.TestCase):
                          "read_only_no_array_access")
         self.assertFalse(self.dest.exists())
         self.assertEqual(c.get_calls, [])
+
+    def test_flag_based_read_only_is_capability_error(self):
+        # ART API 35 layout: plain HeapByteBuffer runtime class, boolean
+        # isReadOnly=True on java.nio.ByteBuffer (no R subclass at all)
+        c, buf, arr = make_buffer_client(readonly=True)
+        res_sig = c.sigs[c.obj_type[buf][1]]
+        self.assertEqual(res_sig, "Ljava/nio/HeapByteBuffer;")
+        with self.assertRaises(CapabilityError) as cm:
+            self.export(c, buf)
+        self.assertEqual(cm.exception.context["reason"],
+                         "read_only_no_array_access")
+        self.assertEqual(cm.exception.context["flag_field"], "isReadOnly")
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(c.get_calls, [])  # no array reads before refusal
+
+    def test_libcore_flag_read_only_is_capability_error(self):
+        c, buf, arr = make_buffer_client(layout="libcore", readonly=True)
+        with self.assertRaises(CapabilityError) as cm:
+            self.export(c, buf)
+        self.assertEqual(cm.exception.context["reason"],
+                         "read_only_no_array_access")
+        self.assertFalse(self.dest.exists())
+
+    def test_flag_false_exports_normally(self):
+        c, buf, arr = make_buffer_client(readonly=False)
+        res = self.export(c, buf)
+        self.assertEqual(self.dest.read_bytes(), CORPUS[4096:61440])
+        self.assertTrue(res["state_preserved"])
+        self.assertEqual(c.mutations, [])
 
     def test_direct_buffer_is_capability_error(self):
         c, buf, arr = make_buffer_client()

@@ -62,6 +62,12 @@ MAX_CHUNK_SIZE = 1 << 20
 _ACC_STATIC = 0x8
 _BACKING_NAMES = ("hb", "backingArray")   # OpenJDK/ART, older libcore
 _OFFSET_NAMES = ("offset", "arrayOffset")
+# boolean read-only flags seen on actual runtime layouts: ART (API ~26+,
+# verified on API 35) declares isReadOnly on java.nio.ByteBuffer and uses
+# plain HeapByteBuffer for read-only views (no HeapByteBufferR subclass);
+# "readOnly" covers libcore-style spellings. Value True => capability
+# error; an absent flag is fine (the XxxR structural rule covers those).
+_READ_ONLY_NAMES = ("isReadOnly", "readOnly")
 
 CONSISTENCY_NOTE = (
     "pure JDWP reads while the caller's stop holds the target suspended; "
@@ -233,13 +239,23 @@ class BufferExporter:
                       if n in fields and fields[n]["sig"] == "I"), None)
         mark_f = fields.get("mark") if fields.get("mark", {}).get("sig") == "I" \
             else None
+        ro_f = next((fields[n] for n in _READ_ONLY_NAMES
+                     if n in fields and fields[n]["sig"] == "Z"), None)
 
         fetch = {"backing": backing, "position": pos_f, "limit": lim_f,
-                 "array_offset": off_f, "mark": mark_f}
+                 "array_offset": off_f, "mark": mark_f, "read_only": ro_f}
         ids = [f["id"] for f in fetch.values() if f]
         vals = self._req(self.c.object_get_values, obj, ids)
         got = {name: v for name, v in
                zip((n for n in fetch if fetch[n]), vals)}
+        if got.get("read_only", {}).get("v"):
+            raise CapabilityError(
+                f"read-only ByteBuffer {obj} ({sig}): flag field "
+                f"{ro_f['name']!r} is true; no array access in v1",
+                hint="export the underlying byte[] handle instead, or "
+                     "duplicate the buffer in-app before debugging",
+                reason="read_only_no_array_access",
+                handle=obj, class_sig=sig, flag_field=ro_f["name"])
         arr = got["backing"]["v"]
         if not arr:
             raise CapabilityError(
