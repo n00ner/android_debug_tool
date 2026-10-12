@@ -251,7 +251,7 @@ class JdwpClient:
         self._rt_methods_cache: dict[int, list[dict]] = {}
         self._super_cache: dict[int, int] = {}  # cid -> super cid; -1 = interface
         self._resolve_cache: dict[tuple[int, str, str | None], tuple[int, int]] = {}
-        self._pair_cache: set[tuple[int, int]] = set()  # coherent (class, method)
+        self._pair_cache: dict[tuple[int, int], int] = {}  # (class, method) -> declaring class
 
     # -- connection ----------------------------------------------------------
     def connect(self) -> None:
@@ -694,11 +694,12 @@ class JdwpClient:
 
         validated (default): verify locally that method_id belongs to
         class_id's hierarchy and that obj's runtime class descends from
-        class_id BEFORE sending — a mismatched pair killed the JDWP
+        class_id BEFORE sending, then serialize the method's DECLARING
+        class — a (subclass, ancestor-method) pair killed the JDWP
         connection on Android 15 (issue #22). Pass validated=False for
         the raw unchecked behavior."""
         if validated:
-            self.validate_instance_method(
+            class_id = self.validate_instance_method(
                 class_id, method_id, obj=obj,
                 nonvirtual=bool(options & INVOKE_NONVIRTUAL))
         w = Writer(self.sizes)
@@ -833,7 +834,7 @@ class JdwpClient:
 
     def validate_instance_method(self, class_id: int, method_id: int,
                                  obj: int | None = None,
-                                 nonvirtual: bool = False) -> None:
+                                 nonvirtual: bool = False) -> int:
         """Local pre-flight for a raw (class_id, method_id) pair, before
         any invoke request is sent:
           - method_id must be declared by class_id or an ancestor; with
@@ -841,8 +842,12 @@ class JdwpClient:
             which implementation executes);
           - when obj is given, its runtime class must be class_id or a
             descendant of it.
-        Raises ResolveError on unrelated/stale IDs, CapabilityError when
-        the walk hits an interface."""
+        Returns the class_id to serialize on the wire: the method's
+        DECLARING class for virtual calls — pairing a subclass type ID
+        with an inherited method ID disconnected ART on Android 15 —
+        and class_id itself for nonvirtual. Raises ResolveError on
+        unrelated/stale IDs, CapabilityError when the walk hits an
+        interface."""
         if nonvirtual:
             declared = {m["id"] for m in self._rt_methods_cached(class_id)}
             if method_id not in declared:
@@ -859,11 +864,15 @@ class JdwpClient:
                 raise ResolveError(
                     f"method_id {method_id} is not declared by class "
                     f"{class_id} or any ancestor (stale or foreign ID?)")
-        elif (class_id, method_id) not in self._pair_cache:
+            declaring = class_id
+        elif (class_id, method_id) in self._pair_cache:
+            declaring = self._pair_cache[(class_id, method_id)]
+        else:
             for cid in self._hierarchy(class_id):
                 if any(m["id"] == method_id
                        for m in self._rt_methods_cached(cid)):
-                    self._pair_cache.add((class_id, method_id))
+                    self._pair_cache[(class_id, method_id)] = cid
+                    declaring = cid
                     break
             else:
                 raise ResolveError(
@@ -880,6 +889,7 @@ class JdwpClient:
                     "of it",
                     hint="the class_id/method_id pair belongs to a "
                          "different object or connection epoch")
+        return declaring
 
     def find_method(self, class_id: int, name: str,
                     sig: str | None = None) -> tuple[int, int]:
