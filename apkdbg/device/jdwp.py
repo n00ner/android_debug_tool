@@ -74,6 +74,9 @@ STEP_INTO, STEP_OVER, STEP_OUT = 0, 1, 2
 # invoke options
 INVOKE_SINGLE_THREADED, INVOKE_NONVIRTUAL = 1, 2
 
+# method modifier bits (java.lang.reflect.Modifier)
+ACC_STATIC = 0x0008
+
 # event request modifier kinds
 MOD_COUNT, MOD_THREAD_ONLY, MOD_CLASS_ONLY, MOD_CLASS_MATCH = 1, 3, 4, 5
 MOD_CLASS_EXCLUDE, MOD_LOCATION_ONLY, MOD_STEP, MOD_INSTANCE_ONLY = 6, 7, 10, 11
@@ -242,7 +245,7 @@ class JdwpClient:
         self._dead: Exception | None = None
         self._reader_t: threading.Thread | None = None
         self.handshake_info: dict = {}
-        # Resolution caches for the checked invoke path (issue #22).
+        # Resolution caches for the checked invoke paths (issues #22, #23).
         # INVARIANT: DebugSession._attach creates a NEW JdwpClient per
         # (re)connect, so instance lifetime == connection epoch; type and
         # method IDs are per-connection and must never leak across epochs.
@@ -251,7 +254,7 @@ class JdwpClient:
         self._rt_methods_cache: dict[int, list[dict]] = {}
         self._super_cache: dict[int, int] = {}  # cid -> super cid; -1 = interface
         self._resolve_cache: dict[tuple[int, str, str | None], tuple[int, int]] = {}
-        self._pair_cache: set[tuple[int, int]] = set()  # coherent (class, method)
+        self._pair_cache: dict[tuple[int, int], int] = {}  # (class, method) -> declaring class
 
     # -- connection ----------------------------------------------------------
     def connect(self) -> None:
@@ -703,11 +706,12 @@ class JdwpClient:
 
         validated (default): verify locally that method_id belongs to
         class_id's hierarchy and that obj's runtime class descends from
-        class_id BEFORE sending — a mismatched pair killed the JDWP
+        class_id BEFORE sending, then serialize the method's DECLARING
+        class — a (subclass, ancestor-method) pair killed the JDWP
         connection on Android 15 (issue #22). Pass validated=False for
         the raw unchecked behavior."""
         if validated:
-            self.validate_instance_method(
+            class_id = self.validate_instance_method(
                 class_id, method_id, obj=obj,
                 nonvirtual=bool(options & INVOKE_NONVIRTUAL))
         w = Writer(self.sizes)
@@ -721,8 +725,8 @@ class JdwpClient:
         w.u32(options)
         r = self.request(CS_OBJECTREF, OR_INVOKE, bytes(w.buf))
         val = r.value()
-        # spec says: exception is an untagged objectID. Android 15's
-        # JVMTI-based JDWP agent emits it as a TAGGED value ('L' + id).
+        # per the JDWP spec the exception is a tagged-objectID; some
+        # agents emit it as a bare (untagged) objectID — tolerate both.
         remaining = len(r.b) - r.p
         if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
             r.u8()  # skip the tag byte
@@ -735,6 +739,59 @@ class JdwpClient:
         w.reftype_id(class_id)
         return self.request(CS_CLASSTYPE, CT_SUPERCLASS,
                             bytes(w.buf)).reftype_id()
+
+    def _rt_methods_cached(self, type_id: int) -> list[dict]:
+        if type_id not in self._rt_methods_cache:
+            self._rt_methods_cache[type_id] = self.rt_methods(type_id)
+        return self._rt_methods_cache[type_id]
+
+    def ct_invoke_method(self, class_id: int, thread: int, method_id: int,
+                         args: list[tuple[int, object]] | None = None,
+                         options: int = INVOKE_SINGLE_THREADED,
+                         *, validated: bool = True) -> dict:
+        """ClassType.InvokeMethod: invoke a STATIC method in the suspended
+        thread. args: list of (tag, python_value). Returns
+        {value, exception}.
+
+        validated (default): method_id must be a STATIC method declared
+        by class_id itself (rt_methods lists declared methods only; no
+        superclass walk — statics are never inherited through a subclass
+        invoke). Instance methods, <init> and foreign/stale IDs are
+        rejected locally BEFORE any request is sent (issue #23). Pass
+        validated=False for the raw unchecked behavior."""
+        if validated:
+            m = next((m for m in self._rt_methods_cached(class_id)
+                      if m["id"] == method_id), None)
+            if m is None:
+                raise ResolveError(
+                    f"method_id {method_id} is not declared by class "
+                    f"{class_id} (stale or foreign ID?)",
+                    hint="use method IDs from rt_methods(class_id); IDs "
+                         "are per-connection — re-resolve after reconnect")
+            if m["name"] == "<init>" or not (m["mod_bits"] & ACC_STATIC):
+                raise ResolveError(
+                    f"ClassType.InvokeMethod takes a STATIC method of "
+                    f"class {class_id}, got {m['name']}{m['sig']} "
+                    f"(mod_bits={m['mod_bits']:#06x})",
+                    hint="use invoke_object_method for instance methods, "
+                         "ct_new_instance for constructors")
+        w = Writer(self.sizes)
+        w.reftype_id(class_id)
+        w.object_id(thread)
+        w.method_id(method_id)
+        args = args or []
+        w.u32(len(args))
+        for tag, v in args:
+            w.value(tag, v)
+        w.u32(options)
+        r = self.request(CS_CLASSTYPE, CT_INVOKE, bytes(w.buf))
+        val = r.value()
+        # per the JDWP spec the exception is a tagged-objectID; some
+        # agents emit it as a bare (untagged) objectID — tolerate both.
+        remaining = len(r.b) - r.p
+        if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
+            r.u8()  # skip the tag byte
+        return {"value": val, "exception": r.object_id()}
 
     def ct_new_instance(self, class_id: int, thread: int, method_id: int,
                         args: list[tuple[int, object]] | None = None,
@@ -772,6 +829,8 @@ class JdwpClient:
         w.u32(options)
         r = self.request(CS_CLASSTYPE, 4, bytes(w.buf))
         val = r.value()
+        # per the JDWP spec the exception is a tagged-objectID; some
+        # agents emit it as a bare (untagged) objectID — tolerate both.
         remaining = len(r.b) - r.p
         if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
             r.u8()
@@ -842,7 +901,7 @@ class JdwpClient:
 
     def validate_instance_method(self, class_id: int, method_id: int,
                                  obj: int | None = None,
-                                 nonvirtual: bool = False) -> None:
+                                 nonvirtual: bool = False) -> int:
         """Local pre-flight for a raw (class_id, method_id) pair, before
         any invoke request is sent:
           - method_id must be declared by class_id or an ancestor; with
@@ -850,8 +909,12 @@ class JdwpClient:
             which implementation executes);
           - when obj is given, its runtime class must be class_id or a
             descendant of it.
-        Raises ResolveError on unrelated/stale IDs, CapabilityError when
-        the walk hits an interface."""
+        Returns the class_id to serialize on the wire: the method's
+        DECLARING class for virtual calls — pairing a subclass type ID
+        with an inherited method ID disconnected ART on Android 15 —
+        and class_id itself for nonvirtual. Raises ResolveError on
+        unrelated/stale IDs, CapabilityError when the walk hits an
+        interface."""
         if nonvirtual:
             declared = {m["id"] for m in self._rt_methods_cached(class_id)}
             if method_id not in declared:
@@ -868,11 +931,15 @@ class JdwpClient:
                 raise ResolveError(
                     f"method_id {method_id} is not declared by class "
                     f"{class_id} or any ancestor (stale or foreign ID?)")
-        elif (class_id, method_id) not in self._pair_cache:
+            declaring = class_id
+        elif (class_id, method_id) in self._pair_cache:
+            declaring = self._pair_cache[(class_id, method_id)]
+        else:
             for cid in self._hierarchy(class_id):
                 if any(m["id"] == method_id
                        for m in self._rt_methods_cached(cid)):
-                    self._pair_cache.add((class_id, method_id))
+                    self._pair_cache[(class_id, method_id)] = cid
+                    declaring = cid
                     break
             else:
                 raise ResolveError(
@@ -889,6 +956,7 @@ class JdwpClient:
                     "of it",
                     hint="the class_id/method_id pair belongs to a "
                          "different object or connection epoch")
+        return declaring
 
     def find_method(self, class_id: int, name: str,
                     sig: str | None = None) -> tuple[int, int]:

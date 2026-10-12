@@ -321,27 +321,22 @@ def _extract_entry(session, reg: dict, thread: int) -> dict:
         rec["capture_error"] = str(e)[:120]
         return rec
     # this-object metadata (algorithm, opmode...) — field reads first
-    # (deadlock-free); invokes only when no class-scoped exit requests are
-    # armed, see module docstring
+    # (deadlock-free); getters fill only labels the field reads missed,
+    # and only when no class-scoped exit requests are armed (see module
+    # docstring)
     try:
         this = c.frame_this_object(thread, fr["frame_id"])
-        if this["v"]:
-            if hook.get("meta_fields"):
-                rec["meta"] = read_fields(c, this["v"],
-                                          hook["meta_fields"])
-            elif hook.get("meta") and reg.get("can_invoke"):
-                rec["meta"] = invoke_meta(c, thread, this["v"],
-                                          hook["meta"])
-        # Key objects: expand via declared fields (or invokes when safe)
+        if this["v"] and (hook.get("meta_fields") or hook.get("meta")):
+            rec["meta"] = _meta_with_fallback(
+                c, thread, this["v"], hook.get("meta_fields"),
+                hook.get("meta") if reg.get("can_invoke") else None)
+        # Key objects: expand via declared fields, getters as fallback
         key_node = rec["args"].get("key")
-        if key_node and key_node.get("id"):
-            if hook.get("key_fields"):
-                meta = read_fields(c, key_node["id"], hook["key_fields"])
-            elif hook.get("key_invoke") and reg.get("can_invoke"):
-                meta = invoke_meta(c, thread, key_node["id"],
-                                   hook["key_invoke"])
-            else:
-                meta = {}
+        if key_node and key_node.get("id") and (
+                hook.get("key_fields") or hook.get("key_invoke")):
+            meta = _meta_with_fallback(
+                c, thread, key_node["id"], hook.get("key_fields"),
+                hook.get("key_invoke") if reg.get("can_invoke") else None)
             enc = meta.pop("_encoded", None)
             if isinstance(enc, dict) and enc.get("hex"):
                 meta["encoded"] = enc
@@ -351,6 +346,29 @@ def _extract_entry(session, reg: dict, thread: int) -> dict:
     except Exception as e:
         rec["meta_error"] = str(e)[:120]
     return rec
+
+
+def _meta_with_fallback(c: JdwpClient, thread: int, obj: int,
+                        field_specs: list[dict] | None,
+                        invoke_specs: list[dict] | None) -> dict:
+    """Merge field-read metadata with getter invokes: declared fields win;
+    labels whose field read failed (or which have no field spec, e.g. a
+    custom/provider Key with differently-named backing fields) are filled
+    from the corresponding getters — but only when invoke_specs is not
+    None, i.e. the caller verified invokes are safe (can_invoke)."""
+    meta = read_fields(c, obj, field_specs) if field_specs else {}
+    if not invoke_specs:
+        return meta
+    retry = [inv for inv in invoke_specs
+             if _is_error(meta.get(inv["label"]))]
+    for label, val in invoke_meta(c, thread, obj, retry).items():
+        if not _is_error(val) or label not in meta:
+            meta[label] = val  # getter won, or no field error to keep
+    return meta
+
+
+def _is_error(node) -> bool:
+    return node is None or (isinstance(node, dict) and "error" in node)
 
 
 def _bytes_of(c: JdwpClient, oid: int) -> dict:
