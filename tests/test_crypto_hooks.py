@@ -12,6 +12,7 @@ from apkdbg.debug.session import DebugSession
 from apkdbg.device.jdwp import (
     EVK_BREAKPOINT, EVK_METHOD_EXIT_RET, TAG_ARRAY, TAG_STRING, JdwpError,
 )
+from apkdbg.errors import ResolveError
 
 HOOK = "Cipher.doFinal()"
 CLS_SIG = "Ljavax/crypto/Cipher;"
@@ -121,6 +122,18 @@ class FakeJdwpClient:
 
     def ct_superclass(self, class_id):
         return 0
+
+    def resolve_instance_method(self, type_id, name, sig=None):
+        cid = type_id
+        while cid:
+            m = next((m for m in self.methods.get(cid, [])
+                      if m["name"] == name and
+                      (sig is None or m["sig"] == sig)), None)
+            if m:
+                return (cid, m["id"])
+            cid = self.ct_superclass(cid)
+        raise ResolveError(f"method {name} not found in hierarchy of "
+                           f"{type_id}")
 
     def invoke_object_method(self, obj, thread, class_id, method_id,
                              args, options=1):

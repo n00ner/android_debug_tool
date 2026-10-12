@@ -85,3 +85,7 @@ class SessionError(ApkDbgError):
 
 class ResolveError(ApkDbgError):
     code = "E_RESOLVE"
+
+
+class CapabilityError(ApkDbgError):
+    code = "E_CAPABILITY"
