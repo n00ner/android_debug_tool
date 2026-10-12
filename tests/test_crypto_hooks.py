@@ -41,6 +41,9 @@ class FakeJdwpClient:
         self.fields = {}         # type_id -> [{"id","name","sig","mod_bits"}]
         self.obj_values = {}     # (oid, field_id) -> tagged value
         self.this_obj = None     # oid returned by frame_this_object
+        self.invoke_calls = []   # (oid, method_id) actually invoked
+        self.invoke_values = {}  # method_id -> invoke reply
+        self.allow_invoke = False
         self.fail_set_event = False
         self.fail_thread_frames = False
 
@@ -121,8 +124,13 @@ class FakeJdwpClient:
 
     def invoke_object_method(self, obj, thread, class_id, method_id,
                              args, options=1):
-        raise AssertionError(
-            "invoke must not run while exit requests are armed")
+        self.invoke_calls.append((obj, method_id))
+        if not self.allow_invoke:
+            raise AssertionError(
+                "invoke must not run while exit requests are armed")
+        return self.invoke_values.get(
+            method_id, {"value": {"tag": TAG_STRING, "v": None},
+                        "exception": 0})
 
     def byte_array(self, oid, max_len=65536):
         return self.arrays.get(oid, b"")[:max_len]
@@ -550,6 +558,81 @@ class MetaCaptureTests(unittest.TestCase):
         self.assertEqual(key["algorithm"], "AES")
         self.assertEqual(key["encoded"]["hex"], bytes(range(16)).hex())
         self.assertEqual(rec["args"]["opmode"]["v"], 1)
+
+    def test_meta_getter_fills_missing_field(self):
+        """Missing backing field + can_invoke -> getter fills the label
+        (PR #39 review: the elif regressed getter-based capture)."""
+        c, s, rid = self._install_dofinal(capture_returns=False)
+        c.fields[2000] = []  # no 'transformation' field on this provider
+        c.methods[2000] = [{"name": "getAlgorithm",
+                            "sig": "()Ljava/lang/String;", "id": 6100}]
+        c.allow_invoke = True
+        c.strings[8002] = "AES/GCM/NoPadding"
+        c.invoke_values[6100] = {"value": {"tag": TAG_STRING, "v": 8002},
+                                 "exception": 0}
+        rec = crypto.extract_event(s, bp_event(rid, method=1500))
+        self.assertEqual(rec["meta"]["algorithm"], "AES/GCM/NoPadding")
+        self.assertEqual(c.invoke_calls, [(7001, 6100)])
+
+    def test_meta_successful_field_not_overwritten(self):
+        """A working field read wins; the getter is never invoked."""
+        c, s, rid = self._install_dofinal(capture_returns=False)
+        c.methods[2000] = [{"name": "getAlgorithm",
+                            "sig": "()Ljava/lang/String;", "id": 6100}]
+        c.allow_invoke = True
+        c.strings[8002] = "WRONG"
+        c.invoke_values[6100] = {"value": {"tag": TAG_STRING, "v": 8002},
+                                 "exception": 0}
+        rec = crypto.extract_event(s, bp_event(rid, method=1500))
+        self.assertEqual(rec["meta"]["algorithm"], "AES/CBC/PKCS5Padding")
+        self.assertEqual(c.invoke_calls, [])
+
+    def _install_init_custom_key(self, capture_returns):
+        """Cipher.init(int,Key) with a custom-provider Key whose backing
+        fields are NOT named algorithm/key, so field reads must fail."""
+        c = hook_client()
+        c.frames[11] = [{"frame_id": 1, "location": {}}]
+        c.slot_values[(1, 1)] = 1       # opmode = ENCRYPT_MODE
+        c.slot_values[(1, 2)] = 6001    # key object
+        c.obj_classes[6001] = 3000
+        c.fields[3000] = [{"id": 88, "name": "k", "sig": "[B",
+                           "mod_bits": 0}]  # provider-specific name
+        c.methods[3000] = [
+            {"name": "getAlgorithm", "sig": "()Ljava/lang/String;",
+             "id": 6100},
+            {"name": "getEncoded", "sig": "()[B", "id": 6101}]
+        c.arrays[9002] = bytes(range(16))
+        c.strings[8001] = "ChaCha20"
+        c.invoke_values[6100] = {"value": {"tag": TAG_STRING, "v": 8001},
+                                 "exception": 0}
+        c.invoke_values[6101] = {"value": {"tag": TAG_ARRAY, "v": 9002},
+                                 "exception": 0}
+        s = make_session(c)
+        rep = crypto.install(s, names=["Cipher.init(int,Key)"],
+                             capture_returns=capture_returns)
+        rid = rep["installed"][0]["request_ids"][0]
+        return c, s, rid
+
+    def test_key_custom_provider_getter_fallback(self):
+        """Custom Key: failed field reads fall back to getAlgorithm /
+        getEncoded when invokes are permitted (capture_returns=False)."""
+        c, s, rid = self._install_init_custom_key(capture_returns=False)
+        c.allow_invoke = True
+        rec = crypto.extract_event(s, bp_event(rid))
+        key = rec["args"]["key"]
+        self.assertEqual(key["algorithm"], "ChaCha20")
+        self.assertEqual(key["encoded"]["hex"], bytes(range(16)).hex())
+        self.assertEqual(c.invoke_calls, [(6001, 6100), (6001, 6101)])
+
+    def test_key_custom_provider_no_invoke_when_returns_armed(self):
+        """Same custom Key with capture_returns=True: invokes stay
+        suppressed, field errors are reported in the record."""
+        c, s, rid = self._install_init_custom_key(capture_returns=True)
+        rec = crypto.extract_event(s, bp_event(rid))
+        key = rec["args"]["key"]
+        self.assertIn("error", key["algorithm"])
+        self.assertNotIn("encoded", key)
+        self.assertEqual(c.invoke_calls, [])
 
 
 if __name__ == "__main__":
