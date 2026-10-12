@@ -40,6 +40,19 @@ def parse_manifest_package(manifest: str | Path) -> str | None:
     return m.group(1) if m else None
 
 
+def parse_manifest_debuggable(manifest: str | Path) -> bool | None:
+    """android:debuggable from the <application> element of apktool's decoded
+    AndroidManifest.xml. Returns None when the flag (or the manifest) cannot
+    be established — an explicit unknown, NOT conflatable with the device's
+    ro.debuggable (which governs JDWP for non-debuggable apps)."""
+    p = Path(manifest)
+    if not p.exists():
+        return None
+    m = re.search(r'<application\b[^>]*\bandroid:debuggable="(true|false)"',
+                  p.read_text("utf-8", errors="replace"))
+    return (m.group(1) == "true") if m else None
+
+
 def load_jadx_mapping(path: str | Path | None) -> dict:
     """Returns {"names": {obf_fqcn: deobf_fqcn},
                  "methods": {obf_fqcn: {obf_m: new_m}},
