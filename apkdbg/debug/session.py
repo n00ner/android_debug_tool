@@ -3,6 +3,13 @@
 Robustness policy: every public op goes through _op(), which on a broken
 JDWP socket re-establishes forwarding + handshake once before giving up.
 ADB-level failures raise AdbError with the tool's stderr as the hint.
+
+Event ownership lives in the per-session EventDispatcher (session.events,
+see debug/dispatcher.py): request ids are registered with an owner, event
+kind, and epoch stamp; _attach bumps the epoch so handles from a previous
+connection are dead even when the new connection reuses numeric ids.
+bp_registry remains the request_id -> meta store (compatibility view) and
+holds live entries of the current epoch only.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from ..device.jdwp import (
 from ..errors import AttachUnavailableError, LineMappingError, ResolveError, SessionError
 from ..protocol import log_progress
 from . import translate
+from .dispatcher import EventDispatcher
 
 STEP_KINDS = {"into": STEP_INTO, "over": STEP_OVER, "out": STEP_OUT}
 
@@ -35,6 +43,15 @@ class DebugSession:
         self.port: int | None = None
         self.bp_registry: dict[int, dict] = {}   # request_id -> meta
         self._sig_cache: dict[int, str] = {}     # type_id -> signature
+
+    @property
+    def events(self) -> EventDispatcher:
+        """Per-session event dispatcher (lazy so __new__-built test
+        sessions get one on first use)."""
+        d = self.__dict__.get("_dispatcher")
+        if d is None:
+            d = self.__dict__["_dispatcher"] = EventDispatcher(self)
+        return d
 
     # ------------------------------------------------------------------ conn
     def connect(self, package: str, *, launch: bool = False,
@@ -59,6 +76,7 @@ class DebugSession:
         # request IDs and type IDs are per-connection: drop stale state
         self.bp_registry.clear()
         self._sig_cache.clear()
+        self.events.bump_epoch()
         last: JdwpConnError | None = None
         for level in (None, "reconnect", "kill-server"):
             if level:
@@ -163,8 +181,10 @@ class DebugSession:
                             "java_line": res["java_line"],
                             "dalvik_line": res["dalvik_line"],
                             "bytecode_index": idx, "spec": spec,
-                            "smali": res["smali"]}
-                    self.bp_registry[rid] = meta
+                            "smali": res["smali"],
+                            "owner": "user", "kind": EVK_BREAKPOINT,
+                            "entry": "source"}
+                    self.events.register(rid, meta)
                     placed.append(meta)
             if not placed:
                 raise ResolveError(
@@ -185,40 +205,65 @@ class DebugSession:
         return ", ".join(str(r["dalvik_line"]) for r in rows) or "none"
 
     def delete_breakpoint(self, request_id: int) -> dict:
-        def do(c: JdwpClient):
-            c.clear_event(EVK_BREAKPOINT, request_id)
-        self._op(do)
-        meta = self.bp_registry.pop(request_id, None)
-        return {"cleared": request_id, "was": meta}
+        """Clear a breakpoint. Non-BREAKPOINT entries are cleared with
+        their registered kind (same path as clear_request): clearing a
+        method-exit hook as BREAKPOINT would leave the real request armed."""
+        return self.clear_request(request_id)
 
     def clear_request(self, request_id: int) -> dict:
         """Clear an event request with the event kind it was registered
-        under (defaults to BREAKPOINT for untracked ids)."""
-        kind = self.bp_registry.get(request_id, {}).get("kind",
-                                                        EVK_BREAKPOINT)
+        under (defaults to BREAKPOINT for untracked ids). Only LIVE entries
+        of the current epoch are touched: after a reconnect a stale numeric
+        id may belong to an unrelated request of the new connection, so the
+        remote state is left alone and reported as unconfirmed."""
+        meta = self.bp_registry.get(request_id)
+        kind = (meta or {}).get("kind", EVK_BREAKPOINT)
+        if not self.events.is_live(meta):
+            return {"cleared": request_id, "kind": kind,
+                    "was": self.events.unregister(request_id),
+                    "status": "unconfirmed",
+                    "note": "no live request with this id in the current "
+                            "connection epoch; remote state left untouched"}
         def do(c: JdwpClient):
             c.clear_event(kind, request_id)
         self._op(do)
-        meta = self.bp_registry.pop(request_id, None)
-        return {"cleared": request_id, "kind": kind, "was": meta}
+        was = self.events.unregister(request_id)
+        return {"cleared": request_id, "kind": kind, "was": was,
+                "status": "confirmed"}
 
     def list_breakpoints(self) -> list[dict]:
         return list(self.bp_registry.values())
 
     # ----------------------------------------------------------------- events
     def wait_events(self, timeout: float = 60.0) -> dict:
-        ev = self._op(lambda c: c.next_event(timeout))
-        for e in ev["events"]:
-            loc = e.get("location")
-            if loc:
-                e["class_sig"] = self._sig_of(loc["class"])
-                hit = self.bp_registry.get(e["request_id"])
-                if hit:
-                    e["breakpoint"] = {k: hit[k] for k in
-                                       ("spec", "java_line", "smali",
-                                        "method", "hook")
-                                       if k in hit}
-        return ev
+        """Public event interface. Events stashed by background consumers
+        (crypto watch, coverage, conditions — they claim only their own)
+        are drained first; otherwise one composite is fetched and routed
+        through the dispatcher. Only UNCLAIMED events are returned; their
+        suspensions belong to the caller, who owns resume responsibility."""
+        stashed = self.events.drain()
+        if stashed is not None:
+            return stashed
+        return self.events.next_routed(timeout)
+
+    def _enrich_event(self, e: dict) -> None:
+        """Attach class signature and registry context to one event.
+        Source breakpoints and hook entries carry different fields, so
+        enrichment picks keys per entry type and never requires fields a
+        hook entry does not have."""
+        loc = e.get("location")
+        if loc:
+            e["class_sig"] = self._sig_of(loc["class"])
+        hit = self.bp_registry.get(e.get("request_id"))
+        if not hit:
+            return
+        keys = {"source": ("spec", "java_line", "smali", "method"),
+                "hook": ("hook", "spec", "method")}.get(
+            hit.get("entry"), ("spec", "java_line", "smali", "method",
+                               "hook"))
+        bp = {k: hit[k] for k in keys if k in hit}
+        if bp:
+            e["breakpoint"] = bp
 
     def _sig_of(self, type_id: int) -> str:
         if type_id not in self._sig_cache:

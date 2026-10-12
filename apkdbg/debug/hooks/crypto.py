@@ -19,9 +19,30 @@ install(..., capture_returns=True)). Exit requests are class-scoped
 (mod_class_only), so exit events fire for every method of the class and
 must be filtered by exact method id at capture time.
 
-Registration state lives in session.bp_registry (per-session, cleared on
-reconnect): every request id maps to its event kind, hook name, target
-class/method/sig, and owner.
+Registration state lives in session.bp_registry (per-session, per connection
+epoch) via session.events, the EventDispatcher: every request id maps to its
+event kind, hook name, target class/method/sig, capture phase, classloader
+identity, and owner ("crypto"). Entries are stamped with the connection
+epoch and go dead on (re)attach; the symbolic hook definition survives for
+the re-install path (dispatcher.symbolic_hooks). Install is idempotent per
+(hook, type_id, phase): re-running it never duplicates requests. Hooks whose
+classes are not yet loaded are reported with state "pending" — or, with
+install(..., defer=True), get a CLASS_PREPARE watch that auto-installs the
+hook exactly once per prepared class instance (per classloader).
+
+The watch loop (run_watch) is a subscription-based consumer of the
+dispatcher: it receives only crypto-owned events, routed by request id AND
+event kind. Threads suspended by claimed events form a shared lease that is
+released once per thread after every consumer of the composite finished.
+Events the watch does NOT own (user breakpoints, other watchers) are never
+resumed by the loop and never dropped: they are stashed back into the
+dispatcher and surface through the public wait_events interface, whose
+caller inherits resume responsibility for them (the app waits at that stop
+exactly as if the watch were not running). Cleanup runs on completion,
+timeout, capture failure, and cancellation, clears each request with its
+actual event kind, and — if the connection was re-established mid-watch —
+reports the old epoch's requests as UNCONFIRMED instead of clearing numeric
+ids the new connection may have reused.
 
 Metadata (algorithm, encoded key bytes) is captured WITHOUT invokes
 wherever possible: declared instance fields are read directly
@@ -104,84 +125,168 @@ CRYPTO_HOOKS: list[dict] = [
 ]
 
 
+class ClassNotLoaded(ResolveError):
+    """Hook class not loaded yet — the pending (deferrable) state."""
+
+
+class MethodNotFound(ResolveError):
+    """Class loaded but the hooked (method, sig) is absent."""
+
+
+class UnsupportedHook(ResolveError):
+    """Hook target cannot be breakpointed (e.g. native method)."""
+
+
 def install(session, names: list[str] | None = None,
-            capture_returns: bool = False) -> dict:
-    """Register breakpoints for the selected hooks. Hooks whose classes are
-    not yet loaded are reported as pending — the agent should re-run install
-    after the app touches crypto (or drive it with a CLASS_PREPARE watch)."""
-    installed, pending = [], []
+            capture_returns: bool = False, defer: bool = False) -> dict:
+    """Register breakpoints for the selected hooks. Every hook ends in one
+    distinct state: installed / pending (class not loaded — deferrable) /
+    not-found / unsupported / failed. With defer=True, pending hooks also
+    get a CLASS_PREPARE watch that installs them exactly once per prepared
+    class instance; the watch request is crypto-owned and is cleaned up
+    like any other request."""
+    d = session.events
+    installed, pending, deferred = [], [], []
+    states = {}
     for hook in CRYPTO_HOOKS:
         if names and hook["name"] not in names:
             continue
         try:
-            regs = _install_one(session.client, hook, capture_returns)
-        except Exception as e:
-            pending.append({"hook": hook["name"], "reason": str(e)[:120]})
+            regs = _install_one(session, hook, capture_returns)
+        except ClassNotLoaded as e:
+            states[hook["name"]] = "pending"
+            pending.append({"hook": hook["name"], "state": "pending",
+                            "reason": str(e)[:120]})
+            if defer:
+                rid = d.defer_hook(
+                    "crypto", hook["name"], _class_pattern(hook["cls"]),
+                    _make_on_prepare(session, hook, capture_returns),
+                    symbolic={"owner": "crypto", "hook": hook["name"],
+                              "hook_def": hook,
+                              "capture_returns": capture_returns})
+                deferred.append({"hook": hook["name"], "request_id": rid})
             continue
+        except (MethodNotFound, UnsupportedHook) as e:
+            state = ("not-found" if isinstance(e, MethodNotFound)
+                     else "unsupported")
+            states[hook["name"]] = state
+            pending.append({"hook": hook["name"], "state": state,
+                            "reason": str(e)[:120]})
+            continue
+        except Exception as e:
+            states[hook["name"]] = "failed"
+            pending.append({"hook": hook["name"], "state": "failed",
+                            "reason": str(e)[:120]})
+            continue
+        states[hook["name"]] = "installed"
         installed.append({"hook": hook["name"],
                           "request_ids": [r["rid"] for r in regs]})
-        for r in regs:
-            session.bp_registry[r["rid"]] = {
-                "owner": "crypto", "hook": hook["name"], "hook_def": hook,
-                "kind": r["kind"], "phase": r["phase"],
-                "cls": hook["cls"], "type_id": r["type_id"],
-                "method": hook["method"], "sig": hook["sig"],
-                "method_id": r["method_id"], "vregs": r["vregs"],
-                "can_invoke": not capture_returns,
-                "spec": hook["method"] + hook["sig"]}
     return {"installed": installed, "pending": pending,
-            "note": "pending hooks: class not loaded yet; re-install later"}
+            "deferred": deferred, "states": states,
+            "note": "pending hooks: class not loaded yet; re-install later "
+                    "or install with defer=True for CLASS_PREPARE "
+                    "auto-install"}
 
 
-def _install_one(c: JdwpClient, hook: dict,
-                 capture_returns: bool) -> list[dict]:
+def _install_one(session, hook: dict, capture_returns: bool,
+                 only_type_ids: set[int] | None = None) -> list[dict]:
     """Register entry breakpoint (+ optional class-scoped method-exit) for
-    every loaded class implementing the hooked method. On partial failure,
-    already-registered requests are cleared before re-raising."""
+    every loaded class implementing the hooked method. Idempotent per
+    (hook, type_id, phase): classes already hooked in this epoch contribute
+    their existing request ids instead of duplicate requests. On partial
+    failure, only the requests registered by THIS call are cleared."""
+    c = session.client
     classes = c.classes_by_signature(hook["cls"])
     if not classes:
-        raise ResolveError(f"{hook['cls']} not loaded")
-    regs = []
+        raise ClassNotLoaded(f"{hook['cls']} not loaded")
+    live = {rid: m for rid, m in session.bp_registry.items()
+            if m.get("owner") == "crypto" and m.get("hook") == hook["name"]
+            and session.events.is_live(m)}
+    done = {(m["type_id"], m["phase"]) for m in live.values()}
+    regs = [{"rid": rid, "kind": m["kind"], "phase": m["phase"],
+             "type_id": m["type_id"], "method_id": m["method_id"],
+             "vregs": m.get("vregs")}
+            for rid, m in live.items()]
+    new = []
     try:
         for cls in classes:
-            m = next((m for m in c.rt_methods(cls["type_id"])
+            tid = cls["type_id"]
+            if only_type_ids is not None and tid not in only_type_ids:
+                continue
+            want_exit = capture_returns and (tid, "return") not in done
+            if (tid, "entry") in done and not want_exit:
+                continue
+            m = next((m for m in c.rt_methods(tid)
                       if m["name"] == hook["method"]
                       and m["sig"] == hook["sig"]), None)
             if not m:
-                raise ResolveError(f"{hook['method']}{hook['sig']} not found")
+                raise MethodNotFound(
+                    f"{hook['method']}{hook['sig']} not found")
+            if m.get("mod_bits", 0) & 0x0100:
+                raise UnsupportedHook(
+                    f"{hook['method']}{hook['sig']} is native")
             try:
-                lt = c.method_line_table(cls["type_id"], m["id"])
+                lt = c.method_line_table(tid, m["id"])
                 idx = lt["lines"][0]["index"] if lt["lines"] else 0
             except Exception:
                 idx = 0  # no debug info on framework classes: entry = index 0
-            vregs = arg_vreg_map(c, cls["type_id"], m["id"])
-            rid = c.set_breakpoint(cls["type_id"], m["id"], idx,
-                                   SP_EVENT_THREAD)
-            regs.append({"rid": rid, "kind": EVK_BREAKPOINT,
-                         "phase": "entry", "type_id": cls["type_id"],
-                         "method_id": m["id"], "vregs": vregs})
-            if capture_returns:
+            vregs = arg_vreg_map(c, tid, m["id"])
+            try:
+                loader = c.rt_class_loader(tid)
+            except Exception:
+                loader = None  # type_id identity still dedupes per loader
+            if (tid, "entry") not in done:
+                rid = c.set_breakpoint(tid, m["id"], idx, SP_EVENT_THREAD)
+                new.append({"rid": rid, "kind": EVK_BREAKPOINT,
+                            "phase": "entry", "type_id": tid,
+                            "method_id": m["id"], "vregs": vregs,
+                            "loader": loader})
+            if want_exit:
                 rid = c.set_event(
                     EVK_METHOD_EXIT_RET, SP_EVENT_THREAD,
-                    [c.mod_class_only(cls["type_id"])])
-                regs.append({"rid": rid, "kind": EVK_METHOD_EXIT_RET,
-                             "phase": "return", "type_id": cls["type_id"],
-                             "method_id": m["id"], "vregs": vregs})
+                    [c.mod_class_only(tid)])
+                new.append({"rid": rid, "kind": EVK_METHOD_EXIT_RET,
+                            "phase": "return", "type_id": tid,
+                            "method_id": m["id"], "vregs": vregs,
+                            "loader": loader})
     except Exception:
-        for r in regs:
+        for r in new:
             try:
                 c.clear_event(r["kind"], r["rid"])
             except Exception:
                 pass
         raise
-    return regs
+    for r in new:
+        session.events.register(r["rid"], {
+            "owner": "crypto", "hook": hook["name"], "hook_def": hook,
+            "entry": "hook", "kind": r["kind"], "phase": r["phase"],
+            "cls": hook["cls"], "type_id": r["type_id"],
+            "loader": r["loader"],
+            "method": hook["method"], "sig": hook["sig"],
+            "method_id": r["method_id"], "vregs": r["vregs"],
+            "can_invoke": not capture_returns,
+            "spec": hook["method"] + hook["sig"]})
+    return regs + new
+
+
+def _class_pattern(sig: str) -> str:
+    """'Ljavax/crypto/Cipher;' -> 'javax.crypto.Cipher' (ClassMatch)."""
+    return sig[1:-1].replace("/", ".") if sig.startswith("L") else sig
+
+
+def _make_on_prepare(session, hook: dict, capture_returns: bool):
+    def on_prepare(ev: dict, handler: dict) -> None:
+        regs = _install_one(session, hook, capture_returns,
+                            only_type_ids={ev.get("type_id")})
+        handler["installed_rids"].extend(r["rid"] for r in regs)
+    return on_prepare
 
 
 def extract_event(session, ev: dict) -> dict | None:
     """Build the compact JSON record for a crypto-hook event. Returns None
     for events not owned by the crypto hooks, and for class-scoped exit
-    events of a different method than the hooked one (caller still resumes
-    the thread)."""
+    events of a different method than the hooked one (the owning
+    subscription still releases the suspension via the lease)."""
     reg = session.bp_registry.get(ev.get("request_id"))
     thread = ev.get("thread")
     if reg is None or reg.get("owner") != "crypto" or thread is None:
@@ -276,22 +381,44 @@ def run_watch(session, duration_s: float = 60.0,
               names: list[str] | None = None,
               capture_returns: bool = False,
               max_events: int = 1000,
-              max_bytes: int = 1 << 20) -> dict:
-    """Blocking watch loop: install hooks, collect events for duration_s
-    (bounded by max_events records / max_bytes of captured JSON), resume
-    suspended threads after each composite, then uninstall every request
-    with its original event kind. Capture/cleanup failures are reported in
-    the result, never swallowed."""
-    rep = install(session, names=names, capture_returns=capture_returns)
+              max_bytes: int = 1 << 20,
+              defer: bool = False) -> dict:
+    """Blocking watch loop: install hooks, then consume crypto-owned events
+    through the session dispatcher for duration_s (bounded by max_events
+    records / max_bytes of captured JSON). The loop claims only its own
+    events: unrelated stops are stashed for the public wait_events caller
+    (counted in "unrelated"), whose consumer owns resume responsibility for
+    them — the watch never resumes threads from events it does not own.
+    Teardown clears every crypto request (including deferred CLASS_PREPARE
+    watches and auto-installed hooks) with its original event kind, on
+    every exit path. If the connection was re-established mid-watch, the
+    dead epoch's requests are reported in "unconfirmed" and the remote is
+    left untouched. Capture/cleanup failures are reported in the result,
+    never swallowed."""
+    d = session.events
+    epoch = d.epoch
+    rep = install(session, names=names, capture_returns=capture_returns,
+                  defer=defer)
     owned = {rid for i in rep["installed"] for rid in i["request_ids"]}
+    owned |= {dfr["request_id"] for dfr in rep["deferred"]}
+    base_owned = set(owned)
     records, errors, cleanup_errors = [], [], []
     captured_bytes, unrelated = 0, 0
     reason = "duration"
+
+    def on_event(ev: dict, lease) -> None:
+        nonlocal captured_bytes
+        rec = extract_event(session, ev)
+        if rec:
+            records.append(rec)
+            captured_bytes += len(json.dumps(rec))
+
+    sub = d.subscribe("crypto", on_event)
     deadline = time.time() + duration_s
     try:
         while time.time() < deadline:
             try:
-                ev = session.wait_events(
+                r = d.next_routed(
                     timeout=max(1.0, deadline - time.time()))
             except Exception as e:
                 if getattr(e, "code", None) != "E_JDWP_TIMEOUT":
@@ -299,26 +426,12 @@ def run_watch(session, duration_s: float = 60.0,
                     errors.append(f"wait: {str(e)[:120]}")
                     log_progress(f"watch loop: {e}")
                 break
-            own_threads, other_threads = set(), set()
-            for e in ev.get("events", []):
-                if e.get("request_id") in owned:
-                    if "thread" in e:
-                        own_threads.add(e["thread"])
-                    rec = extract_event(session, e)
-                    if rec:
-                        records.append(rec)
-                        captured_bytes += len(json.dumps(rec))
-                else:
-                    # not ours: report it, but still resume its thread so
-                    # the app is not left stopped on our account
-                    unrelated += 1
-                    if "thread" in e:
-                        other_threads.add(e["thread"])
-            for t in own_threads | other_threads:
-                try:
-                    session.resume(thread=t)
-                except Exception as ex:
-                    errors.append(f"resume {t}: {str(ex)[:80]}")
+            errors.extend(r.lease.errors)
+            for h in d.deferred_handlers("crypto"):
+                owned.update(h["installed_rids"])
+            if r["events"]:
+                unrelated += len(r["events"])
+                d.stash(r)
             if len(records) >= max_events:
                 reason = "max_events"
                 break
@@ -326,13 +439,28 @@ def run_watch(session, duration_s: float = 60.0,
                 reason = "max_bytes"
                 break
     finally:
-        for rid in owned:
-            try:
-                session.clear_request(rid)
-            except Exception as e:
-                cleanup_errors.append(f"clear {rid}: {str(e)[:120]}")
+        sub.close()
+        for h in d.deferred_handlers("crypto"):
+            owned.update(h["installed_rids"])
+        auto_installed = sorted(owned - base_owned)
+        unconfirmed = []
+        if d.epoch != epoch:
+            # reconnected mid-watch: handles are dead and the numeric ids
+            # may have been reused by the new connection — never clear
+            unconfirmed = sorted(owned)
+        else:
+            for rid in sorted(owned):
+                if d.lookup(rid) is None:
+                    continue
+                try:
+                    session.clear_request(rid)
+                except Exception as e:
+                    cleanup_errors.append(f"clear {rid}: {str(e)[:120]}")
     return {"records": records, "hits": len(records),
             "installed": len(rep["installed"]), "pending": rep["pending"],
+            "states": rep["states"], "deferred": rep["deferred"],
+            "auto_installed": auto_installed,
             "reason": reason, "truncated": reason == "max_bytes",
             "captured_bytes": captured_bytes, "unrelated": unrelated,
+            "unconfirmed": unconfirmed,
             "errors": errors, "cleanup_errors": cleanup_errors}

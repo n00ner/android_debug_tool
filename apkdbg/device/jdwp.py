@@ -32,7 +32,7 @@ CS_EVENTREQUEST, CS_STACKFRAME, CS_EVENT = 15, 16, 64
 VM_VERSION, VM_CLASSES_BY_SIG, VM_ALL_THREADS, VM_IDSIZES = 1, 2, 4, 7
 VM_SUSPEND, VM_RESUME, VM_CREATE_STRING = 8, 9, 11
 # ReferenceType commands
-RT_SIGNATURE, RT_FIELDS, RT_METHODS, RT_GETVALUES = 1, 4, 5, 6
+RT_SIGNATURE, RT_CLASS_LOADER, RT_FIELDS, RT_METHODS, RT_GETVALUES = 1, 2, 4, 5, 6
 # ClassType commands
 CT_SUPERCLASS, CT_INVOKE = 1, 3
 # Method commands
@@ -428,6 +428,15 @@ class JdwpClient:
         w = Writer(self.sizes)
         w.reftype_id(type_id)
         return self.request(CS_REFTYPE, RT_SIGNATURE, bytes(w.buf)).string()
+
+    def rt_class_loader(self, type_id: int) -> int:
+        """ReferenceType.ClassLoader — defining loader of a loaded class;
+        0 for the bootstrap loader. Loader identity distinguishes the same
+        class loaded by different classloaders."""
+        w = Writer(self.sizes)
+        w.reftype_id(type_id)
+        return self.request(CS_REFTYPE, RT_CLASS_LOADER,
+                            bytes(w.buf)).object_id()
 
     def rt_methods(self, type_id: int) -> list[dict]:
         w = Writer(self.sizes)

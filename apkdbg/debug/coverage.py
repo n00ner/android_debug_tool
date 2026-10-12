@@ -18,6 +18,15 @@ Branch resolution (line mode): remember the previous observed line per
 thread; when the previous line is an if-* site, the current line decides the
 outcome — equal to the recorded target line means TAKEN, anything else means
 FALL-THROUGH. goto/switch sites are marked hit when executed.
+
+Event consumption goes through the session dispatcher: the tracker
+registers its request under a per-run owner and receives only its own
+events via a subscription. Line-mode thread resumes are released by the
+composite's shared lease (once per thread, after every consumer of the
+composite finished); SP_NONE method-mode events never resume. Events owned
+by others (user breakpoints, crypto hooks) are never consumed or resumed —
+they are stashed back for the public wait_events interface, whose caller
+owns resume responsibility.
 """
 
 from __future__ import annotations
@@ -61,37 +70,46 @@ class CoverageTracker:
     # ------------------------------------------------------------------ run
     def run(self) -> dict:
         c = self.session.client
+        d = self.session.events
         mods = [c.mod_class_match(f"{p}.*") for p in self.packages]
         if self.mode == "method":
-            rid = c.set_event(EVK_METHOD_ENTRY, SP_NONE, mods)
-            kind = EVK_METHOD_ENTRY
+            kind, policy = EVK_METHOD_ENTRY, SP_NONE
         else:
             mods.append(c.mod_thread_only(self.thread))
             # SINGLE_STEP requests require the Step modifier (size+depth);
             # without it ART accepts the request but never fires it
             mods.append(c.mod_step(self.thread, STEP_LINE, STEP_INTO))
-            rid = c.set_event(EVK_SINGLE_STEP, SP_EVENT_THREAD, mods)
-            kind = EVK_SINGLE_STEP
+            kind, policy = EVK_SINGLE_STEP, SP_EVENT_THREAD
+        rid = c.set_event(kind, policy, mods)
+        owner = f"coverage:{self.run_id}"
+        d.register(rid, {"owner": owner, "kind": kind, "entry": "coverage",
+                         "run_id": self.run_id, "mode": self.mode})
+        if self.mode == "line":
             c.thread_resume(self.thread)
 
+        sub = d.subscribe(owner, self._on_event, request_ids={rid})
         deadline = time.time() + self.seconds
         try:
             while self._events < self.budget and time.time() < deadline:
                 try:
-                    ev = self.session.wait_events(
+                    r = d.next_routed(
                         timeout=max(1.0, deadline - time.time()))
                 except Exception:
                     break
-                for e in ev.get("events", []):
-                    if e.get("kind_id") != kind or "location" not in e:
-                        continue
-                    self._events += 1
-                    self._record(e)
-                    if self.mode == "line" and "thread" in e:
-                        c.thread_resume(e["thread"])
+                if r["events"]:
+                    d.stash(r)  # not ours: preserve for wait_events
         finally:
-            c.clear_event(kind, rid)
+            sub.close()
+            self.session.clear_request(rid)  # kind-correct, epoch-checked
         return self.report()
+
+    def _on_event(self, e: dict, lease) -> None:
+        if "location" not in e:
+            return
+        self._events += 1
+        self._record(e)
+        # line mode: the lease releases the thread's suspension after all
+        # consumers of this composite finished (once per thread)
 
     # ---------------------------------------------------------------- record
     def _record(self, e: dict) -> None:
