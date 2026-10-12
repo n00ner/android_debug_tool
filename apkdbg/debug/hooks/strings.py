@@ -592,7 +592,8 @@ def run_watch(session, profiles=None, mode: str = "attributed", *,
               capture_stack: bool = False, thread: int | None = None,
               mod_count: int | None = None, defer: bool = False,
               record: bool = False, scenario: str | None = None,
-              collect_aliases: bool = False, cancel=None) -> dict:
+              collect_aliases: bool = False, cancel=None,
+              on_record=None) -> dict:
     """Blocking string-watch loop: install the profiles, then consume
     strings-owned events through the session dispatcher until a limit
     stops it. Stop reasons: duration | max_events | max_reads |
@@ -613,7 +614,9 @@ def run_watch(session, profiles=None, mode: str = "attributed", *,
     run, one "string_record" event per emitted record carrying profile,
     capture mode, and attribution status. collect_aliases=True additionally
     feeds captured texts to the opt-in alias collector (issue #25;
-    implies recording for evidence)."""
+    implies recording for evidence). While `cancel` is passed, event
+    waits are sliced so a cancel is observed within ~1s; on_record is an
+    optional sink called with each emitted record (issue #34)."""
     from ...core.aliases import AliasStore
     from ..aliascollect import AliasCollector
     profs = [resolve_profile(p) for p in
@@ -673,6 +676,8 @@ def run_watch(session, profiles=None, mode: str = "attributed", *,
             return
         records.append(rec)
         out_bytes += len(json.dumps(rec, default=str))
+        if on_record is not None:
+            on_record(rec)
         # budgets apply mid-composite too: once exhausted, further events
         # of the batch are counted dropped (not read) and the loop stops
         if cfg["_stats"]["reads"] >= max_reads:
@@ -703,10 +708,16 @@ def run_watch(session, profiles=None, mode: str = "attributed", *,
             if cancel is not None and cancel.is_set():
                 reason = "cancelled"
                 break
+            wait = max(1.0, deadline - time.time())
+            if cancel is not None:
+                wait = min(wait, 1.0)  # sliced: cancel visible within ~1s
             try:
-                r = d.next_routed(
-                    timeout=max(1.0, deadline - time.time()))
+                r = d.next_routed(timeout=wait)
             except Exception as e:
+                if cancel is not None \
+                        and getattr(e, "code", None) == "E_JDWP_TIMEOUT" \
+                        and time.time() < deadline:
+                    continue  # sliced wait expired; the window has not
                 if getattr(e, "code", None) != "E_JDWP_TIMEOUT":
                     reason = "error"
                     errors.append(f"wait: {str(e)[:120]}")

@@ -371,7 +371,8 @@ def run_watch(session, duration_s: float = 60.0,
               defer: bool = False,
               record: bool = False,
               scenario: str | None = None,
-              collect_aliases: bool = False) -> dict:
+              collect_aliases: bool = False,
+              cancel=None, on_record=None) -> dict:
     """Blocking watch loop: install hooks, then consume crypto-owned events
     through the session dispatcher for duration_s (bounded by max_events
     records / max_bytes of captured JSON). The loop claims only its own
@@ -397,7 +398,12 @@ def run_watch(session, duration_s: float = 60.0,
     as reviewable alias candidates — recording is implied, so each
     candidate links to its run/event evidence. The result gains an
     "alias_collection" report with the collector's measured JDWP reads
-    and added pause time (no zero-overhead assumption)."""
+    and added pause time (no zero-overhead assumption).
+
+    Cooperative cancellation (issue #34): `cancel` is any object with
+    is_set(); while it is passed, event waits are sliced so a cancel is
+    observed within ~1s even on a quiet target. on_record is an optional
+    sink called with each emitted record (bounded job buffering)."""
     from ...core.aliases import AliasStore
     from ..aliascollect import AliasCollector
     d = session.events
@@ -435,6 +441,8 @@ def run_watch(session, duration_s: float = 60.0,
         if rec:
             records.append(rec)
             captured_bytes += len(json.dumps(rec))
+            if on_record is not None:
+                on_record(rec)
             event_id = None
             if store is not None:
                 hook = _HOOKS_BY_NAME.get(rec.get("hook"), {})
@@ -453,10 +461,19 @@ def run_watch(session, duration_s: float = 60.0,
     deadline = time.time() + duration_s
     try:
         while time.time() < deadline:
+            if cancel is not None and cancel.is_set():
+                reason = "cancelled"
+                break
+            wait = max(1.0, deadline - time.time())
+            if cancel is not None:
+                wait = min(wait, 1.0)  # sliced: cancel visible within ~1s
             try:
-                r = d.next_routed(
-                    timeout=max(1.0, deadline - time.time()))
+                r = d.next_routed(timeout=wait)
             except Exception as e:
+                if cancel is not None \
+                        and getattr(e, "code", None) == "E_JDWP_TIMEOUT" \
+                        and time.time() < deadline:
+                    continue  # sliced wait expired; the window has not
                 if getattr(e, "code", None) != "E_JDWP_TIMEOUT":
                     reason = "error"
                     errors.append(f"wait: {str(e)[:120]}")

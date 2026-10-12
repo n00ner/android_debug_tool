@@ -89,7 +89,8 @@ class BufferExporter:
     def __init__(self, client, *, chunk_size: int = DEFAULT_CHUNK_SIZE,
                  max_bytes: int = DEFAULT_MAX_BYTES,
                  deadline_s: float | None = None,
-                 keep_partial: bool = False, capped: bool = False):
+                 keep_partial: bool = False, capped: bool = False,
+                 cancel=None):
         if not 1 <= chunk_size <= MAX_CHUNK_SIZE:
             raise SessionError(
                 f"chunk_size must be 1..{MAX_CHUNK_SIZE}, got {chunk_size}")
@@ -101,6 +102,7 @@ class BufferExporter:
         self.deadline_s = deadline_s
         self.keep_partial = keep_partial
         self.capped = capped
+        self.cancel = cancel  # cooperative cancel (issue #34), is_set()
         self.requests = 0
         self.chunks = 0
         self._t0 = 0.0
@@ -400,6 +402,8 @@ class BufferExporter:
               sha) -> int:
         done = 0
         while done < total:
+            if self.cancel is not None and self.cancel.is_set():
+                raise _Abort(f"cancelled after {done}/{total} bytes")
             if self.deadline_s is not None \
                     and time.monotonic() - self._t0 > self.deadline_s:
                 raise _Abort(f"deadline exceeded after {done}/{total} bytes")
