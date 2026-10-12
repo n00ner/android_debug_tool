@@ -29,6 +29,8 @@ public class RunReceiver extends BroadcastReceiver {
             "com.apkdbg.cryptofixture.FW_SVC";
     public static final String ACTION_FW_BENCH =
             "com.apkdbg.cryptofixture.FW_BENCH";
+    public static final String ACTION_BUFFERS =
+            "com.apkdbg.cryptofixture.BUFFERS";
     private static final String TAG = "CryptoFixture";
 
     static final byte[] AES_KEY = hex("2b7e151628aed2a6abf7158809cf4f3c");
@@ -67,6 +69,10 @@ public class RunReceiver extends BroadcastReceiver {
                 long acc = FrameworkWork.benchLoop(app, iters);
                 Log.i(TAG, "FWBENCH iters=" + iters + " acc=" + acc);
             }
+            return;
+        }
+        if (ACTION_BUFFERS.equals(intent.getAction())) {
+            BufferWork.build();    // buffer export fixture corpus (#38)
             return;
         }
         if (!ACTION_RUN.equals(intent.getAction())) {

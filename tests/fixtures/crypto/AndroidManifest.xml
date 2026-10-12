@@ -27,6 +27,7 @@
                 <action android:name="com.apkdbg.cryptofixture.FW_STORE" />
                 <action android:name="com.apkdbg.cryptofixture.FW_SVC" />
                 <action android:name="com.apkdbg.cryptofixture.FW_BENCH" />
+                <action android:name="com.apkdbg.cryptofixture.BUFFERS" />
             </intent-filter>
         </receiver>
     </application>
