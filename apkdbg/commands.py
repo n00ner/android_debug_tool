@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .core.aliases import AliasStore, accepted_alias_map
 from .core.init_pipeline import run_init
 from .core.manifests import RunStore, capture_environment
 from .core.project import Project
+from .debug.aliascollect import AliasCollector
 from .debug.conditions import ConditionalEngine
 from .debug.coverage import CoverageTracker
 from .debug.hooks import crypto as crypto_hooks
@@ -81,10 +83,15 @@ def cmd_classes(ctx: Ctx, filter: str = "", limit: int = 50,
     where = "WHERE fqcn LIKE ? OR deobf_fqcn LIKE ?"
     with ctx.project.db() as db:
         rows = db.query(
-            "SELECT fqcn, deobf_fqcn, smali_path FROM classes " + where +
+            "SELECT sig, fqcn, deobf_fqcn, smali_path FROM classes " + where +
             " LIMIT ? OFFSET ?", args + (limit, offset))
         total = db.one("SELECT COUNT(*) AS n FROM classes " + where,
                        args)["n"]
+        # accepted runtime aliases (issue #25): additive annotation next to
+        # fqcn/deobf_fqcn — the original sig/fqcn identity is untouched
+        aliases = accepted_alias_map(db, [r["sig"] for r in rows])
+    for r in rows:
+        r["alias"] = aliases.get(r["sig"])
     return {"classes": rows, **_page_meta(rows, total, limit, offset)}
 
 
@@ -204,26 +211,53 @@ def cmd_resume(ctx: Ctx, thread: int | None = None) -> dict:
 
 def cmd_snapshot(ctx: Ctx, thread: int, depth: int = 3,
                  record: bool = False, run_id: str | None = None,
-                 scenario: str | None = None) -> dict:
+                 scenario: str | None = None,
+                 collect_aliases: bool = False) -> dict:
     s = Snapshotter(ctx.session.client, Budgets(max_depth=depth))
     data = s.snapshot_frame(thread)
-    if record:
+    _annotate_alias(ctx, data, data.get("class"))
+    if record or collect_aliases:
+        # collecting implies recording: candidates need run/artifact evidence
         _persist_snapshot(ctx, s, data, run_id, scenario,
                           scope={"type": "frame", "frame": data.get("frame"),
                                  "class": data.get("class")})
+    if collect_aliases:
+        _collect_snapshot_aliases(ctx, data)
     return data
 
 
 def cmd_dump_object(ctx: Ctx, obj: int, depth: int = 3,
                     record: bool = False, run_id: str | None = None,
-                    scenario: str | None = None) -> dict:
+                    scenario: str | None = None,
+                    collect_aliases: bool = False) -> dict:
     s = Snapshotter(ctx.session.client, Budgets(max_depth=depth))
     data = s.dump_object(obj)
-    if record:
+    _annotate_alias(ctx, data, data.get("cls"))
+    if record or collect_aliases:
         _persist_snapshot(ctx, s, data, run_id, scenario,
                           scope={"type": "object",
                                  "class": data.get("cls")})
+    if collect_aliases:
+        _collect_snapshot_aliases(ctx, data)
     return data
+
+
+def _annotate_alias(ctx: Ctx, data: dict, sig: str | None) -> None:
+    """Additive "alias" field next to the original class identity
+    (issue #25): the accepted runtime alias, never a replacement."""
+    with ctx.project.db() as db:
+        data["alias"] = accepted_alias_map(db, [sig]).get(sig) if sig else None
+
+
+def _collect_snapshot_aliases(ctx: Ctx, data: dict) -> None:
+    """Feed the already-captured snapshot tree to the alias collector
+    (issue #25) and attach its measured report."""
+    collector = AliasCollector(ctx.session, store=AliasStore(ctx.project))
+    collector.collect_from_snapshot(
+        data, {"class_sig": data.get("class") or data.get("cls"),
+               "epoch": ctx.session.events.epoch},
+        run_id=data.get("run_id"), artifact_id=data.get("artifact_id"))
+    data["alias_collection"] = collector.report()
 
 
 def _persist_snapshot(ctx: Ctx, s: Snapshotter, data: dict,
@@ -246,9 +280,11 @@ def _persist_snapshot(ctx: Ctx, s: Snapshotter, data: dict,
 
 
 def cmd_cond(ctx: Ctx, spec: str, pred: dict, capture: list[dict],
-             max_events: int = 2000, timeout: float = 120.0) -> dict:
+             max_events: int = 2000, timeout: float = 120.0,
+             collect_aliases: bool = False) -> dict:
     return ConditionalEngine(ctx.session).run(
-        spec, pred, capture, max_events=max_events, timeout_s=timeout)
+        spec, pred, capture, max_events=max_events, timeout_s=timeout,
+        collect_aliases=collect_aliases)
 
 
 def cmd_hook_crypto(ctx: Ctx, duration: float = 60.0,
@@ -258,20 +294,29 @@ def cmd_hook_crypto(ctx: Ctx, duration: float = 60.0,
                     max_bytes: int = 1 << 20,
                     defer: bool = False,
                     record: bool = False,
-                    scenario: str | None = None) -> dict:
+                    scenario: str | None = None,
+                    collect_aliases: bool = False) -> dict:
     return crypto_hooks.run_watch(ctx.session, duration_s=duration,
                                   names=hooks, capture_returns=returns,
                                   max_events=max_events,
                                   max_bytes=max_bytes, defer=defer,
-                                  record=record, scenario=scenario)
+                                  record=record, scenario=scenario,
+                                  collect_aliases=collect_aliases)
 
 
 def cmd_coverage(ctx: Ctx, packages: list[str], mode: str = "method",
                  thread: int | None = None, budget: int = 20000,
                  seconds: int = 60, scenario: str | None = None) -> dict:
-    return CoverageTracker(ctx.session, packages, mode=mode, thread=thread,
-                           budget=budget, seconds=seconds,
-                           scenario=scenario).run()
+    rep = CoverageTracker(ctx.session, packages, mode=mode, thread=thread,
+                          budget=budget, seconds=seconds,
+                          scenario=scenario).run()
+    # accepted runtime aliases (issue #25): additive {sig: alias} annotation
+    sigs = [k.split("->", 1)[0] for k in
+            (rep.get("methods") or rep.get("lines") or {})]
+    if sigs:
+        with ctx.project.db() as db:
+            rep["aliases"] = accepted_alias_map(db, sigs)
+    return rep
 
 
 # ---------------------------------------------------------- runs (issue #36)
@@ -312,6 +357,63 @@ def cmd_snapshot_diff(ctx: Ctx, a: str, b: str, force: bool = False) -> dict:
     with exactly one snapshot artifact). Compatibility is checked first;
     incompatible captures return explicit reasons unless forced."""
     return snapshot_diff(RunStore(ctx.project), a, b, force=force)
+
+
+# -------------------------------------------------------- aliases (issue #25)
+def cmd_aliases(ctx: Ctx, action: str = "list",
+                candidate_id: str | None = None,
+                class_sig: str | None = None, alias: str | None = None,
+                method: str | None = None, method_sig: str | None = None,
+                status: str | None = None, filter: str | None = None,
+                note: str | None = None, file: str | None = None,
+                limit: int = 50, offset: int = 0,
+                all_apks: bool = False) -> dict:
+    """Review runtime alias candidates: list (bounded pagination) | get |
+    accept | reject | revise | add (manual alias) | export. Candidates are
+    evidence-backed heuristic annotations stored separately from
+    classes.deobf_fqcn and imported mappings; accepting one never changes
+    method resolution or breakpoint targeting. Retention: rows live in the
+    project mapping.db, are carried across re-indexing, and may contain
+    application data — treat exports as sensitive."""
+    store = AliasStore(ctx.project)
+    if action == "list":
+        limit, offset = _page(limit, offset)
+        return store.list(status=status, q=filter, class_sig=class_sig,
+                          all_apks=all_apks, limit=limit, offset=offset)
+    if action == "get":
+        if not candidate_id:
+            raise SessionError("aliases get needs a candidate_id")
+        return store.get(candidate_id)
+    if action == "accept":
+        if not candidate_id:
+            raise SessionError("aliases accept needs a candidate_id")
+        return store.accept(candidate_id, note=note)
+    if action == "reject":
+        if not candidate_id:
+            raise SessionError("aliases reject needs a candidate_id")
+        return store.reject(candidate_id, note=note)
+    if action == "revise":
+        if not candidate_id or not alias:
+            raise SessionError("aliases revise needs candidate_id and --alias",
+                               hint="the replacement alias text")
+        return store.revise(candidate_id, alias, note=note)
+    if action == "add":
+        if not class_sig or not alias:
+            raise SessionError("aliases add needs --class-sig and --alias",
+                               hint="class_sig is the original runtime "
+                                    "descriptor, e.g. Lcom/foo/Bar;")
+        return store.add_alias(class_sig, alias, method_name=method,
+                               method_sig=method_sig, note=note)
+    if action == "export":
+        data = store.export()
+        if file:
+            Path(file).write_text(
+                json.dumps(data, indent=1, ensure_ascii=False), "utf-8")
+        return {"file": file, "candidates": len(data["candidates"]),
+                "manifest": data}
+    raise SessionError(f"unknown aliases action {action!r}",
+                       hint="list | get | accept | reject | revise | add | "
+                            "export")
 
 
 def cmd_native(ctx: Ctx, limit: int = 200, offset: int = 0) -> dict:
@@ -356,5 +458,6 @@ COMMANDS = {
     "coverage": cmd_coverage,
     "runs": cmd_runs,
     "snapshot_diff": cmd_snapshot_diff,
+    "aliases": cmd_aliases,
     "native": cmd_native,
 }

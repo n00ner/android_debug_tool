@@ -162,6 +162,57 @@ CREATE TABLE IF NOT EXISTS artifacts (
   body             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+
+-- runtime alias candidates (issue #25): evidence-backed naming hypotheses.
+-- SEPARATE from classes.deobf_fqcn and imported mappings, which are never
+-- touched by this feature; candidate text is a reviewable annotation, never
+-- an identity, and never participates in method/breakpoint resolution.
+CREATE TABLE IF NOT EXISTS alias_candidates (
+  candidate_id     TEXT PRIMARY KEY,    -- durable id (uuid)
+  apk_sha256       TEXT,                -- APK identity at observation time
+  index_generation INTEGER NOT NULL,    -- static-index generation at capture
+  class_sig        TEXT NOT NULL,       -- original runtime class descriptor
+  method_name      TEXT,                -- set for method-scoped candidates
+  method_sig       TEXT,                -- full method descriptor when scoped
+  classloader_id   INTEGER,             -- loader object id (per-connection, informational)
+  classloader_key  TEXT,                -- epoch:loader identity; distinct loaders
+                                        -- of one class_sig stay separate rows
+  candidate        TEXT NOT NULL,       -- proposed alias text
+  heuristic_score  REAL,                -- heuristic strength, NOT a calibrated
+                                        -- probability (NULL for manual aliases)
+  rule             TEXT NOT NULL,       -- rule id that produced the candidate
+  rules_version    INTEGER NOT NULL,    -- versioned rule set (see core/aliases)
+  source           TEXT NOT NULL,       -- collector | manual
+  run_id           TEXT,                -- producing run (NULL for manual)
+  event_id         TEXT,                -- producing event (NULL for manual)
+  evidence         TEXT NOT NULL,       -- JSON refs: event/run/artifact/label
+  observations     INTEGER NOT NULL DEFAULT 1,  -- dedupe keeps frequency
+  first_seen       TEXT NOT NULL,
+  last_seen        TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'suggested',  -- suggested | accepted |
+                                        -- rejected | superseded
+  created_at       TEXT NOT NULL,
+  decided_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alias_entity
+  ON alias_candidates(class_sig, method_name, method_sig);
+CREATE INDEX IF NOT EXISTS idx_alias_status ON alias_candidates(status);
+
+-- full decision trail per candidate (accept/reject/revise/supersede and
+-- re-suggestion suppression); replacements are reversible from this history
+CREATE TABLE IF NOT EXISTS alias_decisions (
+  id            INTEGER PRIMARY KEY,
+  candidate_id  TEXT NOT NULL REFERENCES alias_candidates(candidate_id),
+  action        TEXT NOT NULL,          -- suggest | resuggest_merged |
+                                        -- resuggest_suppressed | manual_add |
+                                        -- accept | reject | revise | supersede
+  from_status   TEXT,
+  to_status     TEXT NOT NULL,
+  note          TEXT,
+  decided_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alias_decisions_cand
+  ON alias_decisions(candidate_id);
 """
 
 

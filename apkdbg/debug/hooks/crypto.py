@@ -126,6 +126,9 @@ CRYPTO_HOOKS: list[dict] = [
 ]
 
 
+_HOOKS_BY_NAME = {h["name"]: h for h in CRYPTO_HOOKS}
+
+
 class ClassNotLoaded(ResolveError):
     """Hook class not loaded yet — the pending (deferrable) state."""
 
@@ -367,7 +370,8 @@ def run_watch(session, duration_s: float = 60.0,
               max_bytes: int = 1 << 20,
               defer: bool = False,
               record: bool = False,
-              scenario: str | None = None) -> dict:
+              scenario: str | None = None,
+              collect_aliases: bool = False) -> dict:
     """Blocking watch loop: install hooks, then consume crypto-owned events
     through the session dispatcher for duration_s (bounded by max_events
     records / max_bytes of captured JSON). The loop claims only its own
@@ -385,7 +389,17 @@ def run_watch(session, duration_s: float = 60.0,
     as a versioned run manifest (issue #36): capture config, completion
     reason, and counters on the run; one event row per captured record
     (bounded by max_events), keyed by the hook's original class/method
-    descriptor. The result gains a "run_id" key."""
+    descriptor. The result gains a "run_id" key.
+
+    With collect_aliases=True (issue #25), every captured record also feeds
+    the opt-in string-observation collector (debug/aliascollect): strings
+    already captured are analyzed by the versioned heuristics and stored
+    as reviewable alias candidates — recording is implied, so each
+    candidate links to its run/event evidence. The result gains an
+    "alias_collection" report with the collector's measured JDWP reads
+    and added pause time (no zero-overhead assumption)."""
+    from ...core.aliases import AliasStore
+    from ..aliascollect import AliasCollector
     d = session.events
     epoch = d.epoch
     rep = install(session, names=names, capture_returns=capture_returns,
@@ -397,12 +411,43 @@ def run_watch(session, duration_s: float = 60.0,
     captured_bytes, unrelated = 0, 0
     reason = "duration"
 
+    # alias candidates need run/event evidence: collecting implies recording
+    store = RunStore.for_session(session) \
+        if (record or collect_aliases) else None
+    collector = AliasCollector(
+        session, store=AliasStore.for_session(session)) \
+        if collect_aliases else None
+    run_id = None
+    if store is not None:
+        run_id = store.begin_run(
+            "crypto_watch",
+            capture_config={"duration_s": duration_s, "names": names,
+                            "capture_returns": capture_returns,
+                            "max_events": max_events, "max_bytes": max_bytes,
+                            "defer": defer,
+                            "collect_aliases": collect_aliases},
+            scenario=scenario, epoch=epoch,
+            environment=capture_environment(session))
+
     def on_event(ev: dict, lease) -> None:
         nonlocal captured_bytes
         rec = extract_event(session, ev)
         if rec:
             records.append(rec)
             captured_bytes += len(json.dumps(rec))
+            event_id = None
+            if store is not None:
+                hook = _HOOKS_BY_NAME.get(rec.get("hook"), {})
+                event_id = store.add_event(
+                    run_id, "crypto_record", rec,
+                    class_sig=hook.get("cls"),
+                    method_name=hook.get("method"),
+                    method_sig=hook.get("sig"), epoch=epoch)
+            if collector is not None:
+                collector.collect_from_record(
+                    rec, _record_context(session, ev, epoch),
+                    run_id=run_id, event_id=event_id,
+                    client=session.client)
 
     sub = d.subscribe("crypto", on_event)
     deadline = time.time() + duration_s
@@ -447,43 +492,30 @@ def run_watch(session, duration_s: float = 60.0,
                     session.clear_request(rid)
                 except Exception as e:
                     cleanup_errors.append(f"clear {rid}: {str(e)[:120]}")
-    return {"records": records, "hits": len(records),
-            "installed": len(rep["installed"]), "pending": rep["pending"],
-            "states": rep["states"], "deferred": rep["deferred"],
-            "auto_installed": auto_installed,
-            "reason": reason, "truncated": reason == "max_bytes",
-            "captured_bytes": captured_bytes, "unrelated": unrelated,
-            "unconfirmed": unconfirmed,
-            "errors": errors, "cleanup_errors": cleanup_errors,
-            "run_id": _record_run(
-                session, epoch, records, reason, unrelated, errors,
-                {"duration_s": duration_s, "names": names,
-                 "capture_returns": capture_returns,
-                 "max_events": max_events, "max_bytes": max_bytes,
-                 "defer": defer}, record, scenario)}
+        if store is not None:
+            store.end_run(run_id, reason,
+                          counts={"hits": len(records),
+                                  "unrelated": unrelated,
+                                  "errors": len(errors)})
+    out = {"records": records, "hits": len(records),
+           "installed": len(rep["installed"]), "pending": rep["pending"],
+           "states": rep["states"], "deferred": rep["deferred"],
+           "auto_installed": auto_installed,
+           "reason": reason, "truncated": reason == "max_bytes",
+           "captured_bytes": captured_bytes, "unrelated": unrelated,
+           "unconfirmed": unconfirmed,
+           "errors": errors, "cleanup_errors": cleanup_errors,
+           "run_id": run_id}
+    if collector is not None:
+        out["alias_collection"] = collector.report()
+    return out
 
 
-def _record_run(session, epoch: int, records: list, reason: str,
-                unrelated: int, errors: list, capture_config: dict,
-                record: bool, scenario: str | None) -> str | None:
-    """Persist the watch as a run manifest with one event row per record
-    (issue #36); None when recording is off or the session has no project.
-    Event identity uses the hook's original class/method descriptor —
-    never runtime ids."""
-    store = RunStore.for_session(session) if record else None
-    if store is None:
-        return None
-    run_id = store.begin_run(
-        "crypto_watch", capture_config=capture_config, scenario=scenario,
-        epoch=epoch, environment=capture_environment(session))
-    hooks = {h["name"]: h for h in CRYPTO_HOOKS}
-    for rec in records:
-        hook = hooks.get(rec.get("hook"), {})
-        store.add_event(run_id, "crypto_record", rec,
-                        class_sig=hook.get("cls"),
-                        method_name=hook.get("method"),
-                        method_sig=hook.get("sig"), epoch=epoch)
-    store.end_run(run_id, reason,
-                  counts={"hits": len(records), "unrelated": unrelated,
-                          "errors": len(errors)})
-    return run_id
+def _record_context(session, ev: dict, epoch: int) -> dict:
+    """Entity context for alias attribution: the hook's original
+    class/method descriptor plus classloader identity from the registry
+    entry (per-loader candidates stay separate, issue #25)."""
+    reg = session.bp_registry.get(ev.get("request_id")) or {}
+    return {"class_sig": reg.get("cls"), "method_name": reg.get("method"),
+            "method_sig": reg.get("sig"),
+            "classloader_id": reg.get("loader") or None, "epoch": epoch}

@@ -184,43 +184,55 @@ _META: dict[str, dict] = {
     "snapshot": {
         "summary": "budget-capped snapshot of a thread's top frame",
         "result": "frame variable tree with explicit trunc markers; with "
-                  "record=true also run_id/artifact_id",
+                  "record=true also run_id/artifact_id; additive \"alias\" "
+                  "field carries the accepted runtime alias of the frame "
+                  "class (issue #25)",
         "mutates": False, "idempotent": True, "retryable": True,
         "project": True, "session": True,
         "params": {"thread": "JDWP thread id of a suspended thread",
                    "depth": "max object-graph depth",
                    "record": "persist as an artifact under a run manifest",
                    "run_id": "existing run to attach the artifact to",
-                   "scenario": "scenario label for a new run"},
+                   "scenario": "scenario label for a new run",
+                   "collect_aliases": "feed captured strings to the alias "
+                                      "collector (implies record)"},
     },
     "dump_object": {
         "summary": "budget-capped dump of an object graph",
         "result": "object tree with explicit trunc markers; with "
-                  "record=true also run_id/artifact_id",
+                  "record=true also run_id/artifact_id; additive \"alias\" "
+                  "field carries the accepted runtime alias (issue #25)",
         "mutates": False, "idempotent": True, "retryable": True,
         "project": True, "session": True,
         "params": {"obj": "object id", "depth": "max graph depth",
                    "record": "persist as an artifact under a run manifest",
                    "run_id": "existing run to attach the artifact to",
-                   "scenario": "scenario label for a new run"},
+                   "scenario": "scenario label for a new run",
+                   "collect_aliases": "feed captured strings to the alias "
+                                      "collector (implies record)"},
     },
     "cond": {
         "summary": "host-side conditional breakpoint: capture -> evaluate "
                    "-> resume until the predicate matches",
         "result": "match record with captured values, or budget/timeout "
-                  "exhaustion report",
+                  "exhaustion report; with collect_aliases also an "
+                  "alias_collection report (issue #25)",
         "mutates": True, "idempotent": False, "retryable": False,
         "project": True, "session": True,
         "params": {"spec": "breakpoint spec",
                    "pred": "JSON predicate over captured labels",
                    "capture": "JSON capture spec (slots/fields)",
                    "max_events": "safety bound on evaluated hits",
-                   "timeout": "safety bound in seconds"},
+                   "timeout": "safety bound in seconds",
+                   "collect_aliases": "feed captured strings to the alias "
+                                      "collector"},
     },
     "hook_crypto": {
         "summary": "watch javax.crypto/javax.mac calls for N seconds",
         "result": "captured crypto records (keys, plaintexts, ivs) with "
-                  "budget/truncation metadata",
+                  "budget/truncation metadata; with collect_aliases also "
+                  "an alias_collection report with measured JDWP reads "
+                  "and added pause time (issue #25)",
         "mutates": True, "idempotent": False, "retryable": False,
         "project": True, "session": True,
         "params": {"duration": "watch window in seconds",
@@ -230,7 +242,9 @@ _META: dict[str, dict] = {
                    "max_bytes": "safety bound on captured payload bytes",
                    "defer": "auto-install hooks when their class loads",
                    "record": "persist the watch as a run manifest",
-                   "scenario": "scenario label for the run"},
+                   "scenario": "scenario label for the run",
+                   "collect_aliases": "feed captured strings to the alias "
+                                      "collector (implies record)"},
     },
     "coverage": {
         "summary": "method- or line-level coverage for the given packages",
@@ -265,6 +279,34 @@ _META: dict[str, dict] = {
         "params": {"a": "artifact id (or run id with one snapshot)",
                    "b": "artifact id (or run id with one snapshot)",
                    "force": "compare despite incompatibilities"},
+    },
+    "aliases": {
+        "summary": "review runtime alias candidates (issue #25): list | "
+                   "get | accept | reject | revise | add | export — stored "
+                   "separately from deobf/imported mappings, never used "
+                   "for resolution or breakpoint targeting",
+        "result": "list: bounded page of candidates with "
+                  "count/total/limit/offset/truncated; get: candidate with "
+                  "decision trail, source events, and smali links; "
+                  "accept/reject/revise/add: new status plus superseded "
+                  "ids; export: full manifest with decision history",
+        "mutates": True, "idempotent": False, "retryable": True,
+        "project": True, "session": False, "pagination": True,
+        "params": {"action": "list | get | accept | reject | revise | "
+                             "add | export",
+                   "candidate_id": "target candidate for get/accept/"
+                                   "reject/revise",
+                   "class_sig": "original runtime descriptor (add, or "
+                                "list filter), e.g. Lcom/foo/Bar;",
+                   "alias": "alias text for add/revise",
+                   "method": "method-scoped alias: method name",
+                   "method_sig": "method-scoped alias: descriptor",
+                   "status": "list filter: suggested | accepted | "
+                             "rejected | superseded",
+                   "filter": "list: substring match on candidate/class",
+                   "note": "decision note recorded in the trail",
+                   "file": "export destination path",
+                   "all_apks": "list candidates of every indexed APK"},
     },
     "native": {
         "summary": "native-method inventory + lldb-server orchestration "

@@ -18,9 +18,10 @@ Entity IDs are resolved deterministically with upsert ... RETURNING (SQLite
 INSERT OR IGNORE. All APK-derived tables are rebuilt from scratch per
 generation, so entities absent from the new APK disappear.
 
-Observation tables (runs/events/artifacts/coverage_hits, issue #36) are
-historical runtime data: they are copied unchanged into each new generation
-and keep the index_generation they were captured against.
+Observation tables (runs/events/artifacts/coverage_hits, issue #36, and
+the alias tables of issue #25) are historical runtime data: they are copied
+unchanged into each new generation and keep the index_generation they were
+captured against.
 """
 
 from __future__ import annotations
@@ -39,9 +40,11 @@ from . import manifests
 from .database import INDEX_VERSION, MappingDB
 from .project import Project, _remove_db_files, _remove_sidecars
 
-# historical runtime observations (issue #36): retained across re-indexing,
-# copied into each published generation with their original generation ids
-OBSERVATION_TABLES = ("runs", "events", "artifacts", "coverage_hits")
+# historical runtime observations (issue #36) and reviewable alias
+# candidates (issue #25): retained across re-indexing, copied into each
+# published generation with their original generation ids
+OBSERVATION_TABLES = ("runs", "events", "artifacts", "coverage_hits",
+                      "alias_candidates", "alias_decisions")
 
 
 def run_init(apk: str | Path, project_root: str | Path, *,
@@ -305,10 +308,14 @@ def _build_staging_db(proj: Project, *, apktool_src: Path,
 def _copy_observations(staging: MappingDB, live_db_path: Path) -> None:
     """Copy historical observation tables from the live DB into staging.
     Rows are carried verbatim, keeping each run/event/artifact's original
-    index_generation (issue #36)."""
+    index_generation (issue #36). Tables absent from the live DB (a project
+    created before the feature that added them) are skipped."""
     staging.execute("ATTACH DATABASE ? AS live", (str(live_db_path),))
+    live_tables = {r["name"] for r in staging.query(
+        "SELECT name FROM live.sqlite_master WHERE type='table'")}
     for t in OBSERVATION_TABLES:
-        staging.execute(f"INSERT INTO {t} SELECT * FROM live.{t}")
+        if t in live_tables:
+            staging.execute(f"INSERT INTO {t} SELECT * FROM live.{t}")
     # no explicit DETACH: it cannot run inside the open transaction; the
     # attached handle is released when the staging connection closes
 
