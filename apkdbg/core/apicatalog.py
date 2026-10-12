@@ -445,6 +445,46 @@ _META: dict[str, dict] = {
         "mutates": False, "idempotent": True, "retryable": True,
         "project": True, "session": True, "pagination": True,
     },
+    "export_buffer": {
+        "summary": "bounded binary export of a byte[] or heap ByteBuffer "
+                   "over JDWP (issue #38): chunked pure reads to a temp "
+                   "file published by atomic rename, with SHA-256, range, "
+                   "completeness, and consistency metadata; read-only/"
+                   "direct/unknown buffers fail with a capability error",
+        "result": "{\"complete\", \"export_kind\" (full|capped), source "
+                  "(kind/handle/class_sig/backing translation), range, "
+                  "bytes (requested/exported/sha256), file, timing "
+                  "(elapsed_ms/jdwp_requests/chunks), consistency "
+                  "(never an atomic snapshot), state_preserved}; with "
+                  "record also run_id/artifact_id",
+        "mutates": False, "idempotent": False, "retryable": True,
+        "project": True, "session": True,
+        "params": {"obj": "object handle of the byte[] or ByteBuffer",
+                   "epoch": "connection epoch the handle came from; stale "
+                            "handles fail before any read",
+                   "source": "auto | array | bytebuffer",
+                   "offset": "array index, or offset relative to the "
+                             "buffer position (default 0)",
+                   "length": "bytes to export (default: to the array end / "
+                             "buffer limit)",
+                   "dest": "destination file (default: <project>/exports/"
+                           "buffer-<id>.bin)",
+                   "max_bytes": "safety bound; over-long ranges fail "
+                                "before any file is created unless capped",
+                   "chunk_size": "bytes per JDWP ArrayReference.GetValues "
+                                 "read",
+                   "deadline": "abort after this many seconds (partial "
+                               "file removed unless keep_partial)",
+                   "capped": "deliberate bounded preview: export at most "
+                             "max_bytes of an over-long range (reported "
+                             "capped, complete=false)",
+                   "keep_partial": "retain the partial temp file on abort "
+                                   "(default: removed)",
+                   "record": "persist export metadata as a run artifact",
+                   "run_id": "existing run to attach the artifact to",
+                   "scenario": "scenario label for a new run",
+                   "event_id": "parent event for the artifact"},
+    },
 }
 
 # Hand-written entries for the two protocol methods (no COMMANDS entry).

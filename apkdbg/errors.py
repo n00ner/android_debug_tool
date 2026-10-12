@@ -153,6 +153,19 @@ class ResolveError(ApkDbgError):
     code = "E_RESOLVE"
 
 
+class ExportIncompleteError(ApkDbgError):
+    """A bounded buffer export (issue #38) stopped before the requested
+    range was fully written: deadline/cancel, disconnect, or a host write
+    failure (e.g. disk full). The partial temp file was removed unless the
+    caller explicitly opted into retaining incomplete artifacts
+    (keep_partial); context carries the reason, byte counts, the retained
+    partial path (if any), and elapsed time. An incomplete capture is
+    never reported as complete."""
+    code = "E_EXPORT_INCOMPLETE"
+    retryable = True           # re-issue against fresh handles/epoch
+    outcome = "partial"
+
+
 class CapabilityError(ApkDbgError):
     code = "E_CAPABILITY"
 
