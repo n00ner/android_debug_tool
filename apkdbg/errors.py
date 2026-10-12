@@ -170,6 +170,29 @@ class CapabilityError(ApkDbgError):
     code = "E_CAPABILITY"
 
 
+# -------------------------------------------------- background jobs (issue #34)
+class JobConflictError(ApkDbgError):
+    """A JDWP-owning operation was requested while a background job holds
+    the session: one JDWP socket supports exactly one event-stream reader,
+    so concurrent session operations are rejected early instead of
+    interleaving on the wire. Context carries the running operation id."""
+    code = "E_JOB_CONFLICT"
+    retryable = True           # safe to retry once the running job ends
+
+
+class JobNotFoundError(ApkDbgError):
+    """Unknown operation id — never existed, or evicted by the bounded
+    completed-job retention (job_list shows what is still retained)."""
+    code = "E_JOB_NOT_FOUND"
+
+
+class CursorExpiredError(ApkDbgError):
+    """A job_read cursor points below the retained window: the bounded
+    record buffer already evicted those records (exact expired/dropped
+    counts are in every job_read reply). Re-read from the reported base."""
+    code = "E_CURSOR_EXPIRED"
+
+
 # ------------------------------------------------------- protocol (issue #33)
 class ProtocolError(ApkDbgError):
     """Malformed or unsatisfiable request envelope — deterministic, raised

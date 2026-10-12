@@ -20,7 +20,8 @@ from .debug.hooks import strings as string_hooks
 from .debug.session import DebugSession
 from .debug.snapdiff import snapshot_diff
 from .debug.snapshot import Budgets, Snapshotter
-from .errors import ExportIncompleteError, SessionError
+from .errors import ExportIncompleteError, InvalidParamsError, SessionError
+from .jobs import DEFAULT_MAX_RECORD_BYTES, DEFAULT_MAX_RECORDS, JobRegistry
 
 
 # ------------------------------------------------------------- pagination
@@ -47,6 +48,9 @@ class Ctx:
         self.project = Project.open(project_root)
         self.serial = serial
         self._session: DebugSession | None = None
+        # background jobs (issue #34): one registry per Ctx, so a serve
+        # session's jobs persist across requests
+        self.jobs = JobRegistry()
 
     @property
     def session(self) -> DebugSession:
@@ -68,6 +72,9 @@ class Ctx:
         return self._session
 
     def close(self):
+        # jobs first: their teardown (clearing owned event requests) needs
+        # the live session; the session is closed after bounded cleanup
+        self.jobs.shutdown()
         if self._session:
             self._session.close()
 
@@ -406,9 +413,16 @@ def cmd_framework_events(ctx: Ctx, run_id: str | None = None,
 def cmd_coverage(ctx: Ctx, packages: list[str], mode: str = "method",
                  thread: int | None = None, budget: int = 20000,
                  seconds: int = 60, scenario: str | None = None) -> dict:
+    return _coverage_report(ctx, packages, mode, thread, budget, seconds,
+                            scenario)
+
+
+def _coverage_report(ctx: Ctx, packages: list[str], mode: str,
+                     thread: int | None, budget: int, seconds: int,
+                     scenario: str | None, cancel=None) -> dict:
     rep = CoverageTracker(ctx.session, packages, mode=mode, thread=thread,
                           budget=budget, seconds=seconds,
-                          scenario=scenario).run()
+                          scenario=scenario).run(cancel=cancel)
     # accepted runtime aliases (issue #25): additive {sig: alias} annotation
     sigs = [k.split("->", 1)[0] for k in
             (rep.get("methods") or rep.get("lines") or {})]
@@ -476,6 +490,22 @@ def cmd_export_buffer(ctx: Ctx, obj: int, epoch: int, source: str = "auto",
     completeness) is persisted as a run artifact referencing the file.
     Incomplete outcomes (deadline/disconnect/disk-full) remove the partial
     temp file unless keep_partial and are never reported as complete."""
+    return _export_buffer(ctx, obj, epoch, source=source, offset=offset,
+                          length=length, dest=dest, max_bytes=max_bytes,
+                          chunk_size=chunk_size, deadline=deadline,
+                          capped=capped, keep_partial=keep_partial,
+                          record=record, run_id=run_id, scenario=scenario,
+                          event_id=event_id)
+
+
+def _export_buffer(ctx: Ctx, obj: int, epoch: int, source: str = "auto",
+                   offset: int | None = None, length: int | None = None,
+                   dest: str | None = None,
+                   max_bytes: int = 16 << 20, chunk_size: int = 1 << 16,
+                   deadline: float | None = None, capped: bool = False,
+                   keep_partial: bool = False, record: bool = False,
+                   run_id: str | None = None, scenario: str | None = None,
+                   event_id: str | None = None, cancel=None) -> dict:
     if dest is None:
         dest = str(ctx.project.root / "exports"
                    / f"buffer-{uuid.uuid4().hex[:12]}.bin")
@@ -495,7 +525,8 @@ def cmd_export_buffer(ctx: Ctx, obj: int, epoch: int, source: str = "auto",
         res = session.export_buffer(
             obj, epoch, source=source, offset=offset, length=length,
             dest=dest, max_bytes=max_bytes, chunk_size=chunk_size,
-            deadline=deadline, capped=capped, keep_partial=keep_partial)
+            deadline=deadline, capped=capped, keep_partial=keep_partial,
+            cancel=cancel)
     except ExportIncompleteError as e:
         if store:
             store.add_artifact(
@@ -598,6 +629,138 @@ def cmd_native(ctx: Ctx, limit: int = 200, offset: int = 0) -> dict:
                     "suspend VM via JDWP before native attach to avoid races"}
 
 
+# ------------------------------------------------- background jobs (issue #34)
+# Job-capable collectors. A job runs ONE of these on a worker thread (see
+# jobs.py); each runner gets the job's cancel event and bounded record sink.
+def _job_hook_crypto(ctx: Ctx, job) -> dict:
+    p = job.params
+    return crypto_hooks.run_watch(
+        ctx.session, duration_s=p.get("duration", 60.0),
+        names=p.get("hooks"), capture_returns=p.get("returns", False),
+        max_events=p.get("max_events", 1000),
+        max_bytes=p.get("max_bytes", 1 << 20),
+        defer=p.get("defer", False), record=p.get("record", False),
+        scenario=p.get("scenario"),
+        collect_aliases=p.get("collect_aliases", False),
+        cancel=job.cancel_event, on_record=job.emit)
+
+
+def _job_watch_strings(ctx: Ctx, job) -> dict:
+    p = job.params
+    return string_hooks.run_watch(
+        ctx.session, profiles=p.get("profiles"),
+        mode=p.get("mode", "attributed"),
+        duration_s=p.get("duration", 60.0), scope=p.get("scope"),
+        text_regex=p.get("text_regex"),
+        min_printable=p.get("min_printable", 0.0),
+        dedupe=p.get("dedupe", True),
+        max_events=p.get("max_events", 1000),
+        max_reads=p.get("max_reads", 5000),
+        max_output_bytes=p.get("max_output_bytes", 1 << 20),
+        max_queue=p.get("max_queue", 64),
+        max_stack=p.get("max_stack", 8), max_str=p.get("max_str", 512),
+        thread=p.get("thread"), mod_count=p.get("mod_count"),
+        defer=p.get("defer", False), record=p.get("record", False),
+        scenario=p.get("scenario"),
+        collect_aliases=p.get("collect_aliases", False),
+        cancel=job.cancel_event, on_record=job.emit)
+
+
+def _job_watch_framework(ctx: Ctx, job) -> dict:
+    p = job.params
+    return framework_hooks.run_watch(
+        ctx.session, profiles=p.get("profiles"),
+        families=p.get("families"), mode=p.get("mode", "attributed"),
+        duration_s=p.get("duration", 60.0), scope=p.get("scope"),
+        exclude=p.get("exclude"),
+        invoke_getters=p.get("invoke_getters", False),
+        corr_window_ms=p.get("corr_window_ms", 250),
+        max_events=p.get("max_events", 1000),
+        max_reads=p.get("max_reads", 5000),
+        max_output_bytes=p.get("max_output_bytes", 1 << 20),
+        max_queue=p.get("max_queue", 64),
+        max_stack=p.get("max_stack", 8), max_str=p.get("max_str", 512),
+        thread=p.get("thread"), mod_count=p.get("mod_count"),
+        defer=p.get("defer", False), record=p.get("record", False),
+        scenario=p.get("scenario"),
+        cancel=job.cancel_event, on_record=job.emit)
+
+
+def _job_coverage(ctx: Ctx, job) -> dict:
+    p = job.params
+    return _coverage_report(ctx, p["packages"], p.get("mode", "method"),
+                            p.get("thread"), p.get("budget", 20000),
+                            p.get("seconds", 60), p.get("scenario"),
+                            cancel=job.cancel_event)
+
+
+def _job_export_buffer(ctx: Ctx, job) -> dict:
+    return _export_buffer(ctx, cancel=job.cancel_event, **job.params)
+
+
+_JOB_RUNNERS = {
+    "hook_crypto": _job_hook_crypto,
+    "watch_strings": _job_watch_strings,
+    "watch_framework": _job_watch_framework,
+    "coverage": _job_coverage,
+    "export_buffer": _job_export_buffer,
+}
+
+# job control commands: answered from registry state only (never touch the
+# JDWP socket), so they stay responsive while a worker owns the session
+JOB_COMMANDS = frozenset(
+    {"job_start", "job_status", "job_read", "job_cancel", "job_list"})
+
+
+def cmd_job_start(ctx: Ctx, command: str, params: dict | None = None,
+                  max_records: int = DEFAULT_MAX_RECORDS,
+                  max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES) -> dict:
+    """Start a cancellable background job for a long-lived collector.
+    params are validated against the target command's catalog schema
+    BEFORE the job is queued; at most one job is active per session (one
+    JDWP event-stream reader) — a second start fails with E_JOB_CONFLICT
+    naming the running operation."""
+    from .core import apicatalog  # lazy: apicatalog imports this module
+    if command not in _JOB_RUNNERS:
+        raise InvalidParamsError(
+            f"{command!r} is not job-capable",
+            hint="job-capable commands: " + ", ".join(sorted(_JOB_RUNNERS)))
+    kw = apicatalog.validate_params(apicatalog.entry_for(command),
+                                    params or {})
+    ctx.session  # fail fast before queuing: jobs need a live session
+    return ctx.jobs.start(ctx, command, kw, _JOB_RUNNERS[command],
+                          max_records=max_records,
+                          max_record_bytes=max_record_bytes)
+
+
+def cmd_job_status(ctx: Ctx, operation_id: str) -> dict:
+    """Lifecycle + progress of one job. Idempotent; a terminal job's
+    record is immutable."""
+    return ctx.jobs.get(operation_id).status()
+
+
+def cmd_job_read(ctx: Ctx, operation_id: str, cursor: str | None = None,
+                 limit: int = 100) -> dict:
+    """One bounded page of retained records. Pages resume via the opaque
+    cursor without duplicates/omissions; an expired cursor (records
+    evicted by the bounded buffer) fails with E_CURSOR_EXPIRED."""
+    limit, _ = _page(limit, 0)
+    return ctx.jobs.get(operation_id).read(cursor, limit)
+
+
+def cmd_job_cancel(ctx: Ctx, operation_id: str) -> dict:
+    """Cooperative cancel. Idempotent: repeated cancels return the same
+    (eventually terminal) record."""
+    return ctx.jobs.cancel(operation_id)
+
+
+def cmd_job_list(ctx: Ctx, limit: int = 50, offset: int = 0) -> dict:
+    """Retained jobs (active + bounded completed retention), bounded
+    pagination."""
+    limit, offset = _page(limit, offset)
+    return ctx.jobs.list(limit, offset)
+
+
 COMMANDS = {
     "init": cmd_init,
     "classes": cmd_classes,
@@ -629,4 +792,9 @@ COMMANDS = {
     "export_buffer": cmd_export_buffer,
     "aliases": cmd_aliases,
     "native": cmd_native,
+    "job_start": cmd_job_start,
+    "job_status": cmd_job_status,
+    "job_read": cmd_job_read,
+    "job_cancel": cmd_job_cancel,
+    "job_list": cmd_job_list,
 }

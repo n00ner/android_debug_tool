@@ -43,17 +43,33 @@ device, in both versions:
   describe       the versioned command catalog (params: optional "command")
   capabilities   per-command capability states: supported /
                  unavailable_in_this_session / unverified_runtime
+
+Background jobs (issue #34)
+---------------------------
+Long-running collectors (hook_crypto, watch_strings, watch_framework,
+coverage, export_buffer) run as cancellable background jobs on a worker
+thread (see jobs.py): job_start returns an operation_id, and the main
+loop keeps reading — job_status/job_read/job_cancel/job_list for ANY job
+plus ordinary fast commands are answered while the worker runs. Control
+commands never touch the JDWP socket, so their latency is independent of
+the worker. One JDWP socket has exactly one event-stream reader: at most
+one job is active, and while it is, session-owning commands (including
+connect and events) are rejected early with E_JOB_CONFLICT (retryable)
+instead of interleaving on the wire. EOF signals every job, allows a
+bounded cleanup window, and leaves a deterministic terminal record.
 """
 
 from __future__ import annotations
 
 import json
 import sys
+import threading
 
-from .commands import COMMANDS, Ctx
+from .commands import COMMANDS, JOB_COMMANDS, Ctx
 from .core import apicatalog
 from .errors import (
-    ApkDbgError, InvalidParamsError, InvalidRequestError, MethodNotFoundError,
+    ApkDbgError, InvalidParamsError, InvalidRequestError, JobConflictError,
+    MethodNotFoundError,
 )
 from .protocol import dumps, log_progress
 
@@ -257,19 +273,35 @@ class RpcServer:
         if method == "capabilities":
             return apicatalog.capabilities(self._session_live())
         ctx = self._get_ctx() if entry["requires"]["project"] else None
+        if ctx is not None and method not in JOB_COMMANDS:
+            running = ctx.jobs.active()
+            if running is not None and (entry["requires"]["session"]
+                                        or method == "connect"):
+                # one JDWP socket = one event-stream reader: reject early
+                # instead of interleaving with the job's worker (issue #34)
+                raise JobConflictError(
+                    f"job {running.operation_id} ({running.command}) owns "
+                    f"the JDWP session ({running.state})",
+                    hint="poll job_status, job_cancel it, or wait for it "
+                         "to finish; job control and project-only queries "
+                         "stay available",
+                    operation_id=running.operation_id,
+                    command=running.command, state=running.state)
         return COMMANDS[method](ctx, **kwargs)
 
 
 def serve_stdio(project_root: str, serial: str | None = None) -> None:
     server = RpcServer(project_root, serial=serial)
     log_progress(f"apkdbg serving stdio, project={project_root}")
+    write_lock = threading.Lock()  # one stdout writer; lines never split
     try:
         for line in sys.stdin:
             line = line.strip()
             if not line:
                 continue
-            for reply in server.handle_line(line):
-                sys.stdout.write(dumps(reply) + "\n")
-            sys.stdout.flush()
+            with write_lock:
+                for reply in server.handle_line(line):
+                    sys.stdout.write(dumps(reply) + "\n")
+                sys.stdout.flush()
     finally:
         server.close()

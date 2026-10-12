@@ -378,6 +378,33 @@ def build_parser() -> argparse.ArgumentParser:
                     help="list candidates of every indexed APK, not just "
                          "the current one")
 
+    sp = sub.add_parser("job_start",
+                        help="start a cancellable background job (issue "
+                             "#34); serve mode is the job surface — a "
+                             "one-shot CLI job is cancelled at exit")
+    sp.add_argument("--command", required=True,
+                    help="hook_crypto | watch_strings | watch_framework | "
+                         "coverage | export_buffer")
+    sp.add_argument("--params", help="JSON object of params for --command")
+    sp.add_argument("--max-records", type=int, default=1000)
+    sp.add_argument("--max-record-bytes", type=int, default=1 << 20)
+    sp.add_argument("--pkg")
+
+    sp = sub.add_parser("job_status", help="job lifecycle + progress")
+    sp.add_argument("operation_id")
+
+    sp = sub.add_parser("job_read", help="bounded cursor page of records")
+    sp.add_argument("operation_id")
+    sp.add_argument("--cursor")
+    sp.add_argument("--limit", type=int, default=100)
+
+    sp = sub.add_parser("job_cancel", help="cooperatively cancel a job")
+    sp.add_argument("operation_id")
+
+    sp = sub.add_parser("job_list", help="retained jobs")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+
     sub.add_parser("serve", help="JSON-RPC over stdio (for LLM agents)")
     return p
 
@@ -386,7 +413,8 @@ def build_parser() -> argparse.ArgumentParser:
 SESSION_VERBS = {"bp", "bp_del", "bp_list", "events", "read_var", "write_var",
                  "invoke", "step", "resume", "restore", "snapshot",
                  "dump_object", "cond", "hook_crypto", "watch_strings",
-                 "watch_framework", "coverage", "native", "export_buffer"}
+                 "watch_framework", "coverage", "native", "export_buffer",
+                 "job_start"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -424,8 +452,8 @@ def _kwargs(args: argparse.Namespace) -> dict:
     for k, v in vars(args).items():
         if k in ("cmd", "project", "serial") or v is None:
             continue
-        if k in ("value", "pred", "capture", "args", "profiles") \
-                and isinstance(v, str):
+        if k in ("value", "pred", "capture", "args", "profiles",
+                 "params") and isinstance(v, str):
             v = json.loads(v)
         if k == "no_dedupe":
             k, v = "dedupe", not v
