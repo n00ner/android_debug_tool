@@ -53,6 +53,7 @@ Key design decisions:
 
 | Table | Purpose | Key columns |
 |---|---|---|
+| `meta` | persistent APK/index facts (written by `init`) | `schema_version`, `index_version`, `index_complete`, `index_warnings`, `line_map_state`/`line_map_reason`, `manifest_debuggable`, `apk`/`sha256`/`package` |
 | `classes` | runtime class identity | `sig` (`Lcom/foo/Bar;`), `fqcn`, `deobf_fqcn`, `smali_path` |
 | `methods` | methods per class | `name`, `sig`, `is_native`, smali `line_start/line_end` |
 | `line_map` | `.line N` directives | `method_id`, `dalvik_line`, `smali_line` |
@@ -64,10 +65,44 @@ Key design decisions:
 
 ## Command surface
 
-Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`.
-Session (use `serve` mode for multi-step): `connect`, `bp`, `bp_del`,
-`bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
-`snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`, `native`.
+Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
+`capabilities`. Session (use `serve` mode for multi-step): `connect`, `bp`,
+`bp_del`, `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`,
+`resume`, `snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`,
+`native`.
+
+## Capability matrix (`capabilities`)
+
+`capabilities` reports — **offline, no device needed, never attaches by
+default** — what this project/APK can actually do, per capability:
+`{"status": supported|limited|unsupported|unknown, "evidence": {...},
+"source": ..., "hint": ...}`. A summary `mode` is included but the
+per-capability records are authoritative.
+
+| Capability | Status basis (offline) |
+|---|---|
+| `classes`, `methods`, `res`, `res_refs` | `supported` with row counts as evidence; `unknown` when the index is incomplete |
+| `source_line_resolution` | `supported` when the line map has rows; `unsupported` (`no_line_directives`, likely stripped) when a *completed* index has zero rows; `unknown` (`index_incomplete` / `no_index_metadata`) when an empty map proves nothing |
+| `jdwp_attach` | `unknown`/`limited` from the **manifest** `android:debuggable` fact (true/false/unknown — never conflated with the device's `ro.debuggable`, never treated as proof) |
+| `runtime_line_table`, `connect`, `bp`, and all other runtime commands | `unknown` pre-probe (`static_inference`), each reported individually |
+
+Persistent facts are recorded by `init` in `mapping.db`'s `meta` table
+(`schema_version`, `index_version`, counts, `index_complete`,
+`index_warnings`, `line_map_state`/`line_map_reason`, `manifest_debuggable`).
+Zero line-map rows are **not** treated as proof of stripped debug info: an
+index-generation failure records `index_incomplete` instead.
+
+`capabilities --probe` adds **explicit, transient** live observations (never
+persisted over the static facts): device presence → process presence → JDWP
+attach state → observed runtime `Method.LineTable` availability
+(present/absent/unknown). Observed entries flip `source` to `observed`.
+
+Structured runtime error codes (single-line JSON, machine-readable `code` +
+`hint`): `E_DEVICE_ABSENT` (no adb device), `E_PROCESS_ABSENT` (target not
+running), `E_ATTACH_UNAVAILABLE` (JDWP refused after recovery ladder, e.g.
+non-debuggable app), `E_LINE_MAPPING` (`bp` on an empty/incomplete line map —
+hint points at smali/method-entry coordinates), `E_UNSUPPORTED` (feature not
+supported for this APK/device).
 
 ```bash
 # 1. init: decompile + build mapping DB

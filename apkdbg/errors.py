@@ -38,12 +38,41 @@ class MappingError(ApkDbgError):
     code = "E_MAPPING"
 
 
+class LineMappingError(MappingError):
+    """Source-line resolution impossible: the static line map is empty or
+    incomplete, so a java:line breakpoint has no verified source-to-runtime
+    mapping."""
+    code = "E_LINE_MAPPING"
+
+
 class AdbError(ApkDbgError):
     code = "E_ADB"
 
 
+class DeviceAbsentError(AdbError):
+    """No device/emulator visible to adb at all."""
+    code = "E_DEVICE_ABSENT"
+
+
+class ProcessNotFoundError(AdbError):
+    """Device is there, but the target package has no running process."""
+    code = "E_PROCESS_ABSENT"
+
+
 class JdwpError(ApkDbgError):
     code = "E_JDWP"
+
+
+class AttachUnavailableError(JdwpError):
+    """The VM refused JDWP attach after the full recovery ladder — typically
+    a non-debuggable app on a non-rooted device."""
+    code = "E_ATTACH_UNAVAILABLE"
+
+
+class UnsupportedFeatureError(ApkDbgError):
+    """A command/capability is not supported for this APK/index/device
+    combination (distinct from transient failures)."""
+    code = "E_UNSUPPORTED"
 
 
 class JdwpReplyError(JdwpError):
