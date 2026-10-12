@@ -229,6 +229,30 @@ to `MAX_PAGE = 500`) and return explicit truncation metadata:
   without a mapping json the dalvik-line identity pivot is used (exact for
   non-recompiled debuggable APKs).
 
+## Tests
+
+The full offline suite (device-free; JDWP fakes, temp SQLite projects,
+packaging/install smoke test) runs with one command from a fresh
+checkout — stdlib only, no third-party dependencies:
+
+```bash
+python -m unittest discover -s tests
+```
+
+CI (`.github/workflows/tests.yml`) builds the wheel, installs it, and
+runs this command on Python 3.10–3.13 (Linux, plus Windows on 3.13);
+no device or emulator is involved.
+
+Optional on-device validation against the debuggable fixture APK
+(`tests/fixtures/crypto/`, rebuildable from checked-in source — see its
+README) is a separate, documented runner that skips cleanly when no
+device is attached:
+
+```bash
+adb -s <serial> install -r tests/fixtures/crypto/crypto_fixture.apk
+python tests/integration/run_fixture_scenarios.py <serial>
+```
+
 ## Troubleshooting
 
 **JDWP handshake fails with EOF / connection drops immediately.**
