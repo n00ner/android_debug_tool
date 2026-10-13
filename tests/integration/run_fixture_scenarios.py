@@ -120,8 +120,11 @@ class Runner:
                                extras: list[str],
                                expected: list[str]) -> dict:
         self.adb.shell("logcat -c", check=False)
+        # -f 32 = FLAG_INCLUDE_STOPPED_PACKAGES: a freshly installed
+        # fixture is in the stopped state and would never receive the
+        # broadcast, silently failing every scenario
         cmd = " ".join(["am", "broadcast", "-a", action, "-p", PKG,
-                        *extras])
+                        "-f", "32", *extras])
         self.adb.shell(cmd)
         deadline = time.time() + 20
         log = ""
@@ -145,8 +148,9 @@ class Runner:
         try:
             pid = self.adb.wait_pid(PKG, timeout=10)
         except ApkDbgError:
-            # broadcast RUN starts the process via its receiver
-            self.adb.shell(f"am broadcast -a {PKG}.RUN -p {PKG}")
+            # broadcast RUN starts the process via its receiver (include
+            # stopped packages: the fixture may be freshly installed)
+            self.adb.shell(f"am broadcast -a {PKG}.RUN -p {PKG} -f 32")
             try:
                 pid = self.adb.wait_pid(PKG, timeout=10)
             except ApkDbgError as e:
