@@ -375,6 +375,9 @@ class InstallTests(unittest.TestCase):
         rep = framework.install(s, [framework.resolve_profile(
             "store.putstring")])
         self.assertEqual(rep["states"], {"store.putstring": "unsupported"})
+        # without defer no preparation watch is armed
+        self.assertEqual(rep["deferred"], [])
+        self.assertEqual(c.set_calls, [])
 
     def test_overload_matched_by_exact_sig(self):
         c = nav_client()
@@ -472,6 +475,49 @@ class DeferTests(unittest.TestCase):
         self.assertEqual(res["transactions"][0]["commit_result"], True)
         self.assertEqual(set(c.cleared), {(EVK_CLASS_PREPARE, 1),
                                           (EVK_METHOD_EXIT_RET, 2)})
+
+    def test_defer_covers_concrete_impl_when_only_interface_loaded(self):
+        # startup order: the Editor interface is already loaded, the AOSP
+        # EditorImpl is not — defer must arm a watch for the impl class,
+        # not just for the (loaded, abstract) primary
+        c = store_client()
+        s = make_session(c)
+        loaded = {"yes": False}
+        orig_cbs = c.classes_by_signature
+
+        def cbs(sig):
+            if sig == EDIMPL and not loaded["yes"]:
+                return []
+            return orig_cbs(sig)
+        c.classes_by_signature = cbs
+        orig_next = c.next_event
+
+        def next_then_load(timeout=None):
+            comp = orig_next(timeout)
+            loaded["yes"] = True
+            return comp
+        c.next_event = next_then_load
+        c.event_queue.append(
+            composite({"kind": "class_prepare",
+                       "kind_id": EVK_CLASS_PREPARE, "request_id": 1,
+                       "thread": 11, "type_id": 4001,
+                       "signature": EDIMPL, "status": 0}))
+
+        out = framework.run_watch(s, profiles=["store.commit"],
+                                  duration_s=5, defer=True)
+        self.assertEqual(out["states"], {"store.commit": "unsupported"})
+        # CLASS_PREPARE watches on the unloaded concrete alt patterns
+        pats = [call[2][0] for call in c.set_calls[:2]]
+        self.assertEqual(
+            pats, [("class_match",
+                    "android.app.SharedPreferencesImpl$EditorImpl"),
+                   ("class_match",
+                    "android.app.SharedPreferencesImpl$Editor")])
+        # the late-loaded concrete impl got hooked and is cleaned up
+        self.assertEqual(out["auto_installed"], [3])
+        self.assertEqual(set(c.cleared), {(EVK_CLASS_PREPARE, 1),
+                                          (EVK_CLASS_PREPARE, 2),
+                                          (EVK_METHOD_EXIT_RET, 3)})
 
 
 # -------------------------------------------------------------------- extract

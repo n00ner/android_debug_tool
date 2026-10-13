@@ -117,12 +117,15 @@ class Project:
         """Resolve staging/publish leftovers so the on-disk project always
         presents exactly one complete generation.
 
-        - publish journal with db_swapped: the new generation is fully
+        - the DB swap committed (db_swapped flag, or the live DB's
+          provenance matches the journaled db_identity — a crash between
+          os.replace and the journal write): the new generation is fully
           selected; only cleanup remained -> finish it.
-        - journal with dirs_swapped only: decompiler dirs were swapped but
-          the DB was not -> roll the dirs back to the previous generation.
-        - journal with neither, or staging artifacts without a journal
-          (crash while building): staging is an incomplete index -> discard.
+        - otherwise: roll back any swapped decompiler dirs (an old dir
+          exists exactly when that swap started, journaled dirs_swapped
+          means every swap completed) and discard the staged generation.
+        - staging artifacts without a journal (crash while building):
+          staging is an incomplete index -> discard.
         """
         journal_path = self.publish_journal_path
         journal = None
@@ -131,23 +134,36 @@ class Project:
                 journal = json.loads(journal_path.read_text("utf-8"))
             except (OSError, json.JSONDecodeError):
                 journal = {}
-            if journal.get("db_swapped"):
+            db_committed = (journal.get("db_swapped")
+                            or self._db_matches(journal.get("db_identity")))
+            if db_committed:
                 self._discard_staging()
                 self._remove_dir(self.apktool_old_dir)
                 self._remove_dir(self.jadx_old_dir)
-            elif journal.get("dirs_swapped"):
+            else:
                 for swap in journal.get("swap", []):
                     live_dir = Path(swap["live"])
                     old_dir = Path(swap["old"])
-                    self._remove_dir(live_dir)
-                    if old_dir.exists():
-                        os.rename(old_dir, live_dir)
-                self._discard_staging()
-            else:
+                    if old_dir.exists() or journal.get("dirs_swapped"):
+                        self._remove_dir(live_dir)
+                        if old_dir.exists():
+                            os.rename(old_dir, live_dir)
                 self._discard_staging()
             journal_path.unlink(missing_ok=True)
         else:
             self._discard_staging()
+
+    def _db_matches(self, identity: dict | None) -> bool:
+        """True when the live mapping.db is already the journaled staged
+        generation — the db swap committed even though the journal's
+        db_swapped write did not."""
+        if not identity or not self.db_path.exists():
+            return False
+        try:
+            with MappingDB(self.db_path) as db:
+                return all(db.get_meta(k) == v for k, v in identity.items())
+        except Exception:
+            return False
 
     def _discard_staging(self) -> None:
         _remove_db_files(self.staging_db_path)

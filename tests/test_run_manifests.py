@@ -374,6 +374,58 @@ class DiffNodeTests(unittest.TestCase):
         out = diff_nodes(flatten_snapshot(a), flatten_snapshot(b))
         self.assertTrue(out["changed"]["f.x"]["type_change"])
 
+    def test_same_string_different_budgets_not_changed(self):
+        a = {"s": "ab", "trunc": True}
+        b = {"s": "abcd", "trunc": True}
+        for x, y, shorter in ((a, b, "a"), (b, a, "b")):
+            out = diff_nodes(flatten_snapshot(x), flatten_snapshot(y))
+            self.assertEqual(out["changed"], {})
+            self.assertEqual(len(out["unknown"]), 1)
+            self.assertEqual(out["unknown"][0]["side"], shorter)
+
+    def test_same_bytes_different_budgets_not_changed(self):
+        a = {"bytes": "aabb", "len": 4, "trunc": True}
+        b = {"bytes": "aabbccdd", "len": 4, "trunc": True}
+        for x, y, shorter in ((a, b, "a"), (b, a, "b")):
+            out = diff_nodes(flatten_snapshot(x), flatten_snapshot(y))
+            self.assertEqual(out["changed"], {})
+            self.assertEqual(len(out["unknown"]), 1)
+            self.assertEqual(out["unknown"][0]["side"], shorter)
+
+    def test_overlapping_prefix_disagreement_is_changed(self):
+        a = {"s": "ab", "trunc": True}
+        b = {"s": "ac", "trunc": True}
+        out = diff_nodes(flatten_snapshot(a), flatten_snapshot(b))
+        self.assertEqual(set(out["changed"]), {"$"})
+        self.assertTrue(out["changed"]["$"]["truncated"])
+        self.assertEqual(out["unknown"], [])
+
+    def test_complete_shorter_side_proves_change(self):
+        a = {"s": "ab"}
+        b = {"s": "abcd", "trunc": True}
+        out = diff_nodes(flatten_snapshot(a), flatten_snapshot(b))
+        self.assertEqual(set(out["changed"]), {"$"})
+        self.assertEqual(out["unknown"], [])
+
+    def test_equal_prefix_one_truncated_is_changed(self):
+        a = {"s": "ab"}
+        b = {"s": "ab", "trunc": True}
+        out = diff_nodes(flatten_snapshot(a), flatten_snapshot(b))
+        self.assertEqual(set(out["changed"]), {"$"})
+
+    def test_bytes_equal_prefix_different_known_len_is_changed(self):
+        a = {"bytes": "aabb", "len": 2}
+        b = {"bytes": "aabb", "len": 4, "trunc": True}
+        out = diff_nodes(flatten_snapshot(a), flatten_snapshot(b))
+        self.assertEqual(set(out["changed"]), {"$"})
+
+    def test_bytes_overlapping_prefix_disagreement_is_changed(self):
+        a = {"bytes": "aabb", "len": 2}
+        b = {"bytes": "aacc", "len": 2}
+        out = diff_nodes(flatten_snapshot(a), flatten_snapshot(b))
+        self.assertEqual(set(out["changed"]), {"$"})
+        self.assertEqual(out["unknown"], [])
+
     def test_added_and_removed_when_fully_observed(self):
         a = obj("LX;", 1, {"keep": 1, "gone": 2})
         b = obj("LX;", 2, {"keep": 1, "new": 3})
