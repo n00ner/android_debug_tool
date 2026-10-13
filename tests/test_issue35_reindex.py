@@ -400,6 +400,85 @@ class RestartRecoveryTests(ReindexTestBase):
         self.assertFalse(proj.publish_journal_path.exists())
         self.assertEqual(self.meta("index_generation"), "1")
 
+    def test_crash_after_db_swap_before_journal_keeps_new_generation(self):
+        # the exact P1 window: os.replace committed but the db_swapped
+        # journal write did not — recovery must NOT roll the dirs back
+        self.init_a()
+        real_write = init_pipeline._write_journal
+
+        def power_loss_on_db_flag(proj, journal):
+            if journal.get("db_swapped"):
+                raise OSError("power loss")
+            real_write(proj, journal)
+
+        with mock.patch.object(init_pipeline, "_write_journal",
+                               power_loss_on_db_flag):
+            with self.assertRaises(OSError):
+                self.init(self.apk_b)
+        journal = json.loads(
+            self.proj().publish_journal_path.read_text("utf-8"))
+        self.assertTrue(journal["dirs_swapped"])
+        self.assertFalse(journal["db_swapped"])
+        Project.open(self.proj_dir)  # recovery: db identity proves the swap
+        # db and dirs are the SAME (new) generation
+        self.assertEqual(self.meta("index_generation"), "2")
+        self.assertEqual(self.meta("package"), "com.example.repackaged")
+        self.assertIn("com.example.repackaged",
+                      self.proj().manifest_path.read_text())
+        with self.proj().db() as db:
+            sigs = {c["sig"] for c in db.query("SELECT sig FROM classes")}
+            self.assertEqual(sigs, {"Lcom/foo/A;", "Lcom/foo/New;"})
+        self.assertFalse(self.proj().publish_journal_path.exists())
+        self.assertFalse(self.proj().apktool_old_dir.exists())
+
+    def test_crash_between_dir_renames_rolls_back(self):
+        # crash after apktool live->old but before staging->live: the
+        # journal still says no swaps; recovery restores via existence
+        self.init_a()
+        real_rename = os.rename
+        calls = []
+
+        def power_loss(src, dst):
+            calls.append(dst)
+            if len(calls) == 2:
+                raise OSError("power loss")
+            return real_rename(src, dst)
+
+        with mock.patch("os.rename", side_effect=power_loss):
+            with self.assertRaises(OSError):
+                self.init(self.apk_b)
+        Project.open(self.proj_dir)
+        self.assertIn('"com.example.app"',
+                      self.proj().manifest_path.read_text())
+        self.assertFalse(self.proj().apktool_old_dir.exists())
+        self.assertFalse(self.proj().apktool_staging_dir.exists())
+        self.assertFalse(self.proj().publish_journal_path.exists())
+        self.assertEqual(self.meta("index_generation"), "1")
+
+    def test_crash_after_dir_swap_before_journal_rolls_back(self):
+        # apktool fully swapped, crash on the first jadx rename — before
+        # dirs_swapped was journaled
+        self.init_a()
+        real_rename = os.rename
+        calls = []
+
+        def power_loss(src, dst):
+            calls.append(dst)
+            if len(calls) == 3:
+                raise OSError("power loss")
+            return real_rename(src, dst)
+
+        with mock.patch("os.rename", side_effect=power_loss):
+            with self.assertRaises(OSError):
+                self.init(self.apk_b)
+        Project.open(self.proj_dir)
+        self.assertIn('"com.example.app"',
+                      self.proj().manifest_path.read_text())
+        self.assertFalse(self.proj().apktool_old_dir.exists())
+        self.assertFalse(self.proj().jadx_staging_dir.exists())
+        self.assertFalse(self.proj().publish_journal_path.exists())
+        self.assertEqual(self.meta("index_generation"), "1")
+
 
 class ProvenanceTests(ReindexTestBase):
     def test_provenance_recorded(self):

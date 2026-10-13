@@ -164,7 +164,9 @@ def run_init(apk: str | Path, project_root: str | Path, *,
 
         # 3. publish: one complete generation, atomically selected ------------
         _publish(proj, swap_apktool=not skip_apktool,
-                 swap_jadx=not skip_jadx)
+                 swap_jadx=not skip_jadx,
+                 db_identity={"sha256": sha,
+                              "index_generation": str(generation)})
     except Exception:
         if not proj.publish_journal_path.exists():
             # failure while staging: discard the incomplete generation
@@ -402,11 +404,14 @@ def _validate_staging(db: MappingDB) -> None:
 
 
 # ------------------------------------------------------------------ publication
-def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool) -> None:
+def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool,
+             db_identity: dict) -> None:
     """Atomically select the staged generation. Journaled: a crash anywhere
     in here is resolved by Project.recover_interrupted_publish(). The DB
     swap is last-but-cleanup and a single os.replace — the point at which
-    the new generation becomes visible."""
+    the new generation becomes visible. db_identity (the staged DB's
+    provenance meta) is journaled up front, so recovery can tell whether
+    the os.replace committed even when the db_swapped write did not."""
     swaps = []
     if swap_apktool:
         swaps.append((proj.apktool_staging_dir, proj.apktool_dir,
@@ -416,6 +421,7 @@ def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool) -> None:
                       proj.jadx_old_dir))
     journal = {"swap": [{"live": str(live), "old": str(old)}
                         for _, live, old in swaps],
+               "db_identity": db_identity,
                "dirs_swapped": False, "db_swapped": False}
     _write_journal(proj, journal)
 
@@ -443,8 +449,9 @@ def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool) -> None:
 
 
 def _write_journal(proj: Project, journal: dict) -> None:
-    proj.publish_journal_path.write_text(
-        json.dumps(journal, indent=1), "utf-8")
+    tmp = proj.publish_journal_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(journal, indent=1), "utf-8")
+    os.replace(tmp, proj.publish_journal_path)
 
 
 def _line_map_state(n_cls: int, n_lines: int) -> tuple[str, str]:
