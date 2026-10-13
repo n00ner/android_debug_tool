@@ -53,8 +53,13 @@ jump that is neither target nor fall-through — e.g. a catch block),
 same line without resolving the branch), `ambiguous_line`.
 
 report() is idempotent: finalization (dangling trace gaps + the
-coverage_hits flush) happens exactly once, so repeated report calls never
-change persisted data.
+coverage_hits/coverage_branch_sites flush) happens exactly once, so
+repeated report calls never change persisted data. Branch outcomes are
+persisted with taken/fallthrough/unknown (with reasons) in separate
+columns, keyed by the descriptor-level site key
+(class->name(desc):dalvik_line:smali_line) — the local integer
+branch_sites.id is not portable between rebuilt indexes and is never
+persisted (issue #29).
 
 Event consumption goes through the session dispatcher: the tracker
 registers its request under a per-run owner and receives only its own
@@ -76,6 +81,7 @@ them incomplete with the stop reason and dropped-event count.
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 
@@ -488,3 +494,15 @@ class CoverageTracker:
                         "method_name,method_sig,dalvik_line,hits) "
                         "VALUES(?,?,?,?,?,?)",
                         (self.run_id, cls, mname, msig, line, hits))
+            for site_key, rec in self.branch_outcomes.items():
+                db.execute(
+                    "INSERT INTO coverage_branch_sites(run_id,site_key,"
+                    "class_sig,method_name,method_sig,dalvik_line,"
+                    "smali_line,opcode,kind,site_hits,taken,fallthrough,"
+                    "unknowns) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (self.run_id, site_key, rec["class"], rec["method"],
+                     rec["sig"], rec["line"], rec["smali_line"], rec["op"],
+                     rec["kind"], rec["site_hits"], rec["taken"],
+                     rec["fallthrough"],
+                     json.dumps(rec["unknown"], separators=(",", ":"))
+                     if rec["unknown"] else None))

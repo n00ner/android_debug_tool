@@ -18,8 +18,9 @@ Entity IDs are resolved deterministically with upsert ... RETURNING (SQLite
 INSERT OR IGNORE. All APK-derived tables are rebuilt from scratch per
 generation, so entities absent from the new APK disappear.
 
-Observation tables (runs/events/artifacts/coverage_hits, issue #36, and
-the alias tables of issue #25) are historical runtime data: they are copied
+Observation tables (runs/events/artifacts/coverage_hits, issue #36,
+coverage_branch_sites, issue #29, and the alias tables of issue #25) are
+historical runtime data: they are copied
 unchanged into each new generation and keep the index_generation they were
 captured against.
 """
@@ -45,6 +46,7 @@ from .project import Project, _remove_db_files, _remove_sidecars
 # retained across re-indexing, copied into each published generation with
 # their original generation ids
 OBSERVATION_TABLES = ("runs", "events", "artifacts", "coverage_hits",
+                      "coverage_branch_sites",
                       "alias_candidates", "alias_decisions",
                       "runtime_artifacts")
 
