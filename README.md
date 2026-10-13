@@ -72,12 +72,51 @@ candidate text never feeds back into resolution or breakpoint targeting.
 
 ## Command surface
 
-Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
-`capabilities`, `runs`, `snapshot_diff`, `coverage_diff`, `aliases`, `strings`.
-Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
-`bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
-`snapshot`, `dump_object`, `cond`, `hook_crypto`, `watch_strings`,
-`coverage`, `native`.
+Stateless (CLI-safe, no live session needed): `init`, `capabilities`,
+`classes`, `methods`, `res`, `res_refs`, `runs`, `snapshot_diff`,
+`coverage_diff`, `aliases`, `strings`, `framework_events`, `unpack_index`,
+`job_status`, `job_read`, `job_list`, `job_cancel` — plus `connect`, which
+establishes the session itself. Session (use `serve` mode for multi-step):
+`restore`, `bp`, `bp_del`, `bp_list`, `events`, `read_var`, `write_var`,
+`invoke`, `step`, `resume`, `snapshot`, `dump_object`, `cond`,
+`hook_crypto`, `watch_strings`, `watch_framework`, `coverage`, `unpack`,
+`export_buffer`, `job_start`, `native`.
+
+## Capability matrix (`capabilities`)
+
+`capabilities` reports — **offline, no device needed, never attaches by
+default** — what this project/APK can actually do, per capability:
+`{"status": supported|limited|unsupported|unknown, "evidence": {...},
+"source": ..., "hint": ...}`. A summary `mode` is included but the
+per-capability records are authoritative.
+
+| Capability | Status basis (offline) |
+|---|---|
+| `classes`, `methods`, `res`, `res_refs` | `supported` with row counts as evidence; `unsupported` with a re-index hint when a *completed* index has zero rows; `unknown` when the index never finished |
+| `source_line_resolution` | `supported` when the line map has rows; `unsupported` (`no_line_directives`, likely stripped) when a *completed* index has zero rows; `unknown` (`index_incomplete` / `no_index_metadata`) when an empty map proves nothing |
+| `jdwp_attach` | `unknown`/`limited` from the **manifest** `android:debuggable` fact (true/false/unknown — never conflated with the device's `ro.debuggable`, never treated as proof) |
+| `runtime_line_table`, `connect`, and the runtime commands (`bp`, `bp_del`, `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`, `snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`, `native`) | `unknown` pre-probe (`static_inference`), each reported individually; `bp` additionally drops to `limited` while the line map is unverified |
+
+Persistent facts are recorded by `init` in `mapping.db`'s `meta` table
+(`schema_version`, `index_version`, counts, `index_complete`,
+`index_warnings`, `line_map_state`/`line_map_reason`, `manifest_debuggable`).
+Zero line-map rows are **not** treated as proof of stripped debug info: an
+index-generation failure records `index_incomplete` instead.
+
+`capabilities --probe` adds **explicit, transient** live observations (never
+persisted over the static facts): device presence → process presence → JDWP
+attach state → observed runtime `Method.LineTable` availability
+(present/absent/unknown). Observed entries flip `source` to `observed`.
+
+Structured runtime error codes (single-line JSON, machine-readable `code` +
+`hint`): `E_DEVICE_ABSENT` (no adb device), `E_PROCESS_ABSENT` (target not
+running), `E_ATTACH_UNAVAILABLE` (JDWP refused after recovery ladder, e.g.
+non-debuggable app), `E_LINE_MAPPING` (`bp` on an empty/incomplete line map —
+hint points at smali/method-entry coordinates), `E_UNSUPPORTED` (feature not
+supported for this APK/device). The recovery, job, and export codes
+(`E_OUTCOME_UNKNOWN`, `E_STALE_HANDLE`, `E_JOB_CONFLICT`, `E_CURSOR_EXPIRED`,
+`E_EXPORT_INCOMPLETE`, `E_CAPABILITY`) are documented in their sections
+below; the full stable set lives in `apkdbg/errors.py`.
 
 ```bash
 # 1. init: decompile + build mapping DB
@@ -164,6 +203,193 @@ tables, and are deleted only with the project. Candidate text and evidence
 may contain application data (captured strings) — treat `aliases export`
 output as sensitive.
 
+## Run manifests and snapshot diff (issue #36)
+
+Any capture run with `record=true` (coverage, `hook_crypto`,
+`watch_strings`, `watch_framework`, `snapshot`, `unpack`, `export_buffer`)
+persists a **run manifest**: durable uuid, APK hash + static-index
+generation, tool version, capture configuration, environment/VM metadata,
+scenario label, session epoch, start/end times, completion reason. Runs,
+events, and artifacts live in their own tables and are carried verbatim
+across re-indexing (#35), keeping the index generation they were captured
+against; runtime object ids are per-connection, so observations keep their
+capture epoch and are never reinterpreted after a reconnect.
+
+```bash
+apkdbg --project ./proj runs list --kind coverage
+apkdbg --project ./proj runs get <run_id>            # manifest + events + artifacts
+apkdbg --project ./proj runs export <run_id> --file run.json
+apkdbg --project ./proj runs import --file run.json  # --replace overwrites a run_id
+```
+
+`snapshot_diff` compares two persisted snapshots as **logical object
+graphs** (structural paths + type-aware values): per-connection runtime
+object ids are never compared across runs, and cycles are re-anchored to
+the target's first occurrence, so equal snapshots under different runtime
+ids produce no spurious changes. Results land in four disjoint buckets —
+`changed`, `added`, `removed`, `unknown` (budget-truncated, inaccessible,
+or absent-debug-info subtrees never masquerade as added/removed). A
+compatibility check (APK identity, scope, capture settings, completeness)
+runs first; incompatible captures return explicit reasons and no diff
+unless `force`, and forced diffs keep every qualification in the output.
+
+## Coverage diff (issue #29)
+
+`coverage_diff` compares two groups of stored coverage runs selected by
+label (scenario or run_id) — fully offline, deterministic for fixed stored
+inputs, no JDWP involved. It ranks three change kinds with explainable
+scores: `presence` (observed in one group only, scaled by within-group
+consistency), `direction` (branch sites whose evidenced taken vs
+fall-through edge flips between groups, scaled by edge purity vs unknown
+outcomes), and `hit_count` (normalized hits per captured event whose
+between-group difference exceeds both groups' within-group spread).
+Unknown branch outcomes stay unknown; degraded runs (budget stops,
+dropped events, cancellations) lower confidence and are listed in the
+`quality` block. A ranked entry is a candidate for investigation — never
+exact subtraction, and absence in a bounded trace is not proof of
+non-execution.
+
+Groups compare only when their runs share APK identity (sha256), index
+generation (site identity is index-bound), capture mode, and package
+scope; incompatible groups return `ranked: null` with explicit reasons
+unless `exploratory`, which yields an annotated intersection — never
+equivalent coverage. Passing the same label twice is an A/A baseline: the
+matched runs split deterministically in half and compare against each
+other, so repeat noise surfaces as low/zero scores instead of phantom
+scenario differences.
+
+```bash
+apkdbg --project ./proj coverage_diff --baseline before-fix --candidate after-fix
+apkdbg --project ./proj coverage_diff --baseline nightly --candidate nightly  # A/A noise
+```
+
+## Framework watchers (issue #27)
+
+Opt-in observation profiles at selected framework method exits
+(METHOD_EXIT_WITH_RETURN_VALUE). `families` enables `navigation`
+(startActivity requests on Activity / ContextWrapper / ContextImpl, per
+overload actually present), `storage` (SharedPreferences$Editor staged
+put*/remove/clear plus apply/commit submissions, correlated per editor
+instance), and `services` (getSystemService lookups counted per service
+name/class); `profiles` takes builtin names, family names, or explicit
+`{"cls","method","sig"}` objects and overrides `families`. Interface or
+late-loaded implementations install via `defer=true` (CLASS_PREPARE
+auto-install per classloader instance). `mode` is `best_effort` (SP_NONE,
+no attribution/args) or `attributed` (SP_EVENT_THREAD, args + bounded
+stack minus excluded framework wrappers, which are never reported as app
+callers). Metadata getter invocation (`invoke_getters`) is an explicit
+opt-in that runs app code on the suspended thread, honors the #21
+class-scoped exit-request reentrancy policy, and never calls toString().
+
+These are observation points with explicit per-profile coverage notes,
+never full-coverage claims: an override that bypasses the superclass body
+produces no event at that class, an observed request is not a confirmed
+navigation (lifecycle profiles only fire when the concrete activity calls
+the superclass body), a staged edit is not persisted data (an editor with
+edits and no observed submission is reported DISCARDED in the derived
+transaction view), and a service lookup is a capability request, not use.
+Records persist as a run manifest with `record=true`; query them offline
+with `framework_events` (filters: `run_id`, `family`, `profile`, `role`).
+
+```bash
+{"id":13,"method":"watch_framework","params":{"duration":60,"families":["navigation","storage"],"mode":"attributed","scope":"com.target.*","record":true}}
+{"id":14,"method":"framework_events","params":{"family":"storage","limit":50}}
+```
+
+## Bounded buffer export (issue #38)
+
+`export_buffer` pulls a `byte[]` or heap ByteBuffer to a host file over
+pure JDWP reads — chunked `ArrayReference.GetValues` through a running
+SHA-256 into a temp file, published by atomic rename only after the last
+byte is hashed, so host memory stays bounded at any export size. ByteBuffer
+ranges default to `[position, limit)` translated through the backing-array
+offset (OpenJDK-style and libcore-style layouts are both recognized, never
+assumed; nested slices work). Read-only views, direct/native buffers, and
+unknown implementations fail with `E_CAPABILITY` — never silently wrong
+bytes. Budgets: `max_bytes` rejects an over-long range before any file is
+created unless `capped=true` deliberately requests a bounded preview
+(reported `export_kind:"capped"`, `complete:false`); `deadline` aborts with
+the partial temp file removed unless `keep_partial`; an aborted export
+surfaces as `E_EXPORT_INCOMPLETE`, never as complete. An export is not an
+atomic snapshot — suspending the event thread does not stop other writers;
+the `consistency` block records this, and for ByteBuffers the
+position/limit/mark triple is re-read afterwards (`state_preserved`).
+
+```bash
+{"id":15,"method":"export_buffer","params":{"obj":4097,"epoch":2,"max_bytes":4194304,"record":true}}
+```
+
+## Runtime DEX unpack discovery (issue #28)
+
+EXPERIMENTAL observation of DEX payloads at Java-visible loading/decryption
+boundaries — **not** a universal unpacker (native payloads, unsupported
+loaders, split writes, and never-stable buffers produce capability/partial
+outcomes, never fake success). `boundaries` selects
+`in_memory_dex_class_loader` (the default; consumed bytes are each buffer's
+`[position, limit)` window, exported through the #38 exporter with distinct
+support per buffer kind), `dex_class_loader_path` (file-path evidence only,
+no memory recovery promised), or explicit hooks; `cipher_overloads` is an
+explicit opt-in observing selected `Cipher.doFinal` return buffers.
+Late-loading boundary classes install via `defer=true`.
+
+Candidates go through a bounded prefix read → DEX magic + structural header
+validation (version, header/file sizes, endian tag, section bounds) →
+export bounded to the declared `file_size` → full artifact validation
+(size, Adler-32 checksum, SHA-1 signature). DEX 041's container format is
+recognized but reported `unsupported` rather than misvalidated; a
+magic-only match is a `candidate`, never a recovered executable, and
+Shannon entropy is recorded as optional evidence only. Outcomes stay
+distinct (`validated | candidate | invalid | truncated | incomplete |
+unsupported | not_dex | empty | path_evidence`); artifacts land on disk
+with JSON sidecars, deduplicated by content SHA-256, never inlined into
+records.
+
+Validated artifacts register into the additive `runtime_artifacts`
+observation table with `index=true` on the run, or afterwards via
+`unpack_index` — hash + origin preserved, the original APK static index is
+never silently replaced.
+
+```bash
+{"id":16,"method":"unpack","params":{"duration":60,"record":true,"index":true}}
+apkdbg --project ./proj unpack_index list
+apkdbg --project ./proj unpack_index index <artifact_id>
+```
+
+## Background jobs (issue #34)
+
+Long-lived collectors run as cancellable background jobs so the server
+keeps answering control requests and project-only queries:
+`job_start` takes a job-capable `command` (`hook_crypto`, `watch_strings`,
+`watch_framework`, `coverage`, `export_buffer`, `unpack`) plus that
+command's `params`, validated against its catalog schema before queuing.
+One active job per session — one JDWP socket supports exactly one
+event-stream reader, so session-owning commands (including
+`connect`/`events`) are rejected early with `E_JOB_CONFLICT` while a job
+runs.
+
+Records live in a bounded ring (`max_records`, `max_record_bytes`; oldest
+expire first) with exact received/retained/dropped/expired counts in every
+reply. `job_read` pages with an opaque cursor — no duplicates or omissions
+among retained records, a cursor below the ring base fails with
+`E_CURSOR_EXPIRED` carrying the valid base, and a null cursor marks only a
+terminal, exhausted stream (a running job always returns a continuation
+cursor). `job_status` reports lifecycle
+(queued/running/cancelling/completed/cancelled/failed) with an immutable
+terminal record carrying an explicit reason (completed, deadline,
+event_budget, output_budget, cancellation, target_exit, disconnect,
+capture_failure) and an `incomplete` flag — a budget-stopped capture is
+never reported silently complete. `job_cancel` is cooperative and
+idempotent; worker teardown clears only the job's own event requests and
+suspensions. `job_list` shows the active job plus the bounded completed-job
+retention.
+
+```bash
+{"id":17,"method":"job_start","params":{"command":"hook_crypto","params":{"duration":300}}}
+{"id":18,"method":"job_status","params":{"operation_id":"<id from job_start>"}}
+{"id":19,"method":"job_read","params":{"operation_id":"<id>","cursor":"<from prior reply>","limit":100}}
+{"id":20,"method":"job_cancel","params":{"operation_id":"<id>"}}
+```
+
 ## Serve-mode protocol (versions, discovery, pagination)
 
 `apkdbg serve` speaks one JSON value per line in both directions; stdout
@@ -210,7 +436,8 @@ applicable. `capabilities` reports per-command states: `supported`,
 `unverified_runtime` (scaffolds such as `native`/lldb).
 
 **Pagination.** All list commands (`classes`, `methods`, `res`, `res_refs`,
-`bp_list`, `runs list`, `aliases list`, `native`) accept `limit`/`offset`
+`bp_list`, `runs list`, `aliases list`, `strings`, `framework_events`,
+`coverage_diff`, `unpack_index`, `job_list`, `native`) accept `limit`/`offset`
 (limit is clamped
 to `MAX_PAGE = 500`) and return explicit truncation metadata:
 `count`, `total`, `limit`, `offset`, `truncated` — same shape as
@@ -286,6 +513,16 @@ reading a reused id. Breakpoint/hook definitions survive as symbolic
 defs: run `restore` after a reconnect (or a process restart + `connect`)
 to re-install them and get the NEW request ids.
 
+**Broadcast-driven captures come back silently empty.** A freshly
+installed or force-stopped app whose receivers are only declared in the
+manifest is in the *stopped* state and is excluded from broadcast
+delivery — no receiver fires, no events appear, nothing errors. Include
+stopped packages explicitly:
+
+```bash
+adb shell am broadcast -a <action> -p <pkg> -f 32   # FLAG_INCLUDE_STOPPED_PACKAGES
+```
+
 **ART JDWP quirks (handled internally, listed for reference):**
 
 - *Tagged exception field.* An invoke reply's exception object is a
@@ -311,8 +548,17 @@ to re-install them and get the NEW request ids.
 
 ## Current status / roadmap
 
-Implemented: init pipeline, mapping DB, JDWP bridge, Perfect Sync breakpoints,
-read/write vars, invoke, step, snapshots, conditional breakpoints, crypto
-hooks, coverage, CLI + JSON-RPC. Scaffolding: `native` (lldb-server
-orchestration plan). Not implemented: full lldb dual-debugging, method-exit
-return capture for all hooks, `Resource.getIdentifier` runtime watch.
+Implemented: init pipeline with transactional re-index (#35), mapping DB,
+JDWP bridge, Perfect Sync breakpoints, read/write vars, invoke, step,
+snapshots + `snapshot_diff`, conditional breakpoints, crypto hooks with
+optional method-exit return capture (`hook_crypto` `returns=true`:
+class-scoped METHOD_EXIT_WITH_RETURN_VALUE requests filtered by exact
+method id, with metadata invokes disabled while exit requests are armed),
+branch/method coverage + `coverage_diff`, string and framework watchers,
+runtime DEX unpack discovery, bounded buffer export, runtime alias review,
+capability matrix, run manifests, background jobs, event dispatcher with
+scoped recovery, versioned command catalog + JSON-RPC 2.0, CLI + stdio
+serve mode. Scaffolding: `native` (lldb-server orchestration plan).
+Not implemented: full lldb dual-debugging, method-exit return capture for
+arbitrary user hooks (exit events are wired only into the crypto, string,
+and framework watcher profiles), `Resource.getIdentifier` runtime watch.
