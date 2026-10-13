@@ -29,7 +29,7 @@ from apkdbg.device.jdwp import (
     JdwpError,
 )
 from apkdbg.errors import JobConflictError, JobNotFoundError
-from apkdbg.jobs import JobRegistry
+from apkdbg.jobs import Job, JobRegistry
 from apkdbg.server import RpcServer
 
 CIPHER = "Ljavax/crypto/Cipher;"
@@ -408,6 +408,33 @@ class CursorTests(unittest.TestCase):
                     {"operation_id": op, "cursor": "nonsense"})
             self.assertEqual(r["error"]["code"], "E_INVALID_PARAMS")
             srv.close()
+
+    def test_running_job_keeps_continuation_cursor_when_caught_up(self):
+        # poll scenario: null mid-run means "oldest retained record" on the
+        # next call, so a caught-up running job must return a continuation
+        # cursor; null is reserved for a terminal, exhausted stream
+        job = Job("hook_crypto", {"duration": 60.0}, 100, 1 << 20)
+        job.mark_running()
+        # empty running job: a checkpoint cursor, not null
+        r = job.read(None, 100)
+        self.assertEqual(r["records"], [])
+        self.assertEqual(r["cursor"], "r0")
+        job.emit({"n": 1})
+        r = job.read(None, 100)
+        self.assertEqual([x["n"] for x in r["records"]], [1])
+        self.assertEqual(r["cursor"], "r1")
+        job.emit({"n": 2})
+        r = job.read(r["cursor"], 100)
+        self.assertEqual([x["n"] for x in r["records"]], [2])  # no dup of 1
+        self.assertEqual(r["cursor"], "r2")
+        # caught up again, still running: continuation cursor
+        r = job.read(r["cursor"], 100)
+        self.assertEqual(r["records"], [])
+        self.assertEqual(r["cursor"], "r2")
+        # terminal + caught up: null — the stream is exhausted
+        job.set_terminal("completed", "deadline", False)
+        r = job.read("r2", 100)
+        self.assertIsNone(r["cursor"])
 
 
 # -------------------------------------------------------------- concurrency

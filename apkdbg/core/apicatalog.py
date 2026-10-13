@@ -531,7 +531,9 @@ _META: dict[str, dict] = {
         "summary": "bounded cursor page of a job's retained records",
         "result": "{\"records\", count, cursor, received/retained/dropped/"
                   "expired, truncated}; pages resume without duplicates "
-                  "or omissions; an expired cursor fails with "
+                  "or omissions; null cursor only on a terminal, exhausted "
+                  "stream (a running job always returns a continuation "
+                  "cursor); an expired cursor fails with "
                   "E_CURSOR_EXPIRED",
         "mutates": False, "idempotent": True, "retryable": True,
         "project": True, "session": False,

@@ -33,7 +33,9 @@ a drop-oldest ring; received/retained/dropped(never retained)/expired
 (evicted) counts are exact and appear in every status/read reply. A read
 cursor is the opaque token "r<absolute index>": pages resume without
 duplicates or omissions among retained records; a cursor below the ring
-base (evicted) fails with E_CURSOR_EXPIRED carrying the valid base.
+base (evicted) fails with E_CURSOR_EXPIRED carrying the valid base. While
+a job can still produce records a read always returns a continuation
+cursor, even when caught up; null marks only a terminal, exhausted stream.
 
 Shutdown
 --------
@@ -238,7 +240,8 @@ class Job:
                    "state": self.state,
                    "records": list(page),
                    "count": len(page),
-                   "cursor": f"r{nxt}" if nxt < end else None,
+                   "cursor": f"r{nxt}" if nxt < end or not self.terminal
+                   else None,
                    "received": self._received,
                    "retained": len(self._records),
                    "dropped": self._dropped,
