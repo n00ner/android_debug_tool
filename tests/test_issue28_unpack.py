@@ -314,12 +314,36 @@ class DexValidationTests(unittest.TestCase):
         self.assertEqual(out["version"], "035")
 
     def test_versions_recognized(self):
-        for v in ("035", "037", "038", "039", "040", "041"):
+        for v in ("035", "037", "038", "039", "040"):
             out = unpack.dex_header_check(make_dex(version=v))
             self.assertEqual(out["result"], "valid", v)
         out = unpack.dex_header_check(make_dex(version="999"))
         self.assertEqual(out["result"], "invalid")
         self.assertIn("version", out["errors"][0])
+
+    def test_dex041_is_recognized_but_unsupported(self):
+        # a version-only-mutated 035 header is NOT accepted as 041...
+        out = unpack.dex_header_check(make_dex(version="041"))
+        self.assertEqual(out["result"], "unsupported")
+        self.assertEqual(out["version"], "041")
+        self.assertTrue(any("041" in e for e in out["errors"]))
+        # ...and neither is a well-formed 041 container header (0x78-byte
+        # header, container-relative offsets): recognized, reported
+        # unsupported, never misclassified as corrupt or validated
+        data = bytearray(0x78 + 4)
+        data[0:8] = b"dex\n041\x00"
+        struct.pack_into("<I", data, 0x20, len(data))  # file_size
+        struct.pack_into("<I", data, 0x24, 0x78)       # 041 header size
+        struct.pack_into("<I", data, 0x28, 0x12345678)
+        struct.pack_into("<I", data, 0x34, 0x78)       # map_off
+        struct.pack_into("<I", data, 0x68, 4)          # data_size
+        struct.pack_into("<I", data, 0x6C, 0x78)       # data_off
+        data[0x0C:0x20] = hashlib.sha1(bytes(data[32:])).digest()
+        struct.pack_into("<I", data, 0x08, zlib.adler32(bytes(data[12:])))
+        out = unpack.dex_header_check(bytes(data))
+        self.assertEqual(out["result"], "unsupported")
+        self.assertEqual(unpack.dex_full_check(bytes(data))["result"],
+                         "unsupported")
 
     def test_bad_magic(self):
         out = unpack.dex_header_check(NON_DEX)
@@ -464,6 +488,37 @@ class ProcessBufferTests(unittest.TestCase):
         self.assertEqual(rec["outcome"], "validated")
         self.assertEqual(rec["sha256"], DEX_SHA256)
         self.assertEqual(self.exports()[0].read_bytes(), DEX)
+
+    def test_export_bounded_to_validated_extent(self):
+        # a valid DEX followed by trailing bytes inside the window: the
+        # run budget and the export cover the validated extent (372), not
+        # the whole 4468-byte window
+        buf = add_heap_buffer(self.c, DEX + b"\xBB" * 4096)
+        ctx = run_ctx(self.s, self.tmp.name, max_run_bytes=1024)
+        rec = process(self.s, ctx, buf)
+        self.assertEqual(rec["outcome"], "validated")
+        self.assertEqual(rec["captured"], len(DEX))
+        self.assertEqual(rec["captured"], rec["expected"])
+        self.assertEqual(rec["export"]["range"]["length"], len(DEX))
+        self.assertEqual(ctx.exported_bytes, len(DEX))
+        self.assertEqual(rec["sha256"], DEX_SHA256)
+        self.assertEqual(self.exports()[0].read_bytes(), DEX)
+        # a second oversized-window candidate is budgeted by its declared
+        # extent, so a small DEX remains exportable within the run budget
+        buf2 = add_heap_buffer(self.c, DEX + b"\xCC" * 4096,
+                               buf_oid=901, arr_oid=801)
+        rec2 = process(self.s, ctx, buf2)
+        self.assertEqual(rec2["outcome"], "validated")
+
+    def test_dex041_buffer_is_unsupported_never_dumped(self):
+        buf = add_heap_buffer(self.c, make_dex(version="041"))
+        ctx = run_ctx(self.s, self.tmp.name)
+        rec = process(self.s, ctx, buf)
+        self.assertEqual(rec["outcome"], "unsupported")
+        self.assertEqual(rec["header"]["version"], "041")
+        self.assertTrue(rec["errors"])
+        self.assertEqual(self.exports(), [])
+        self.assertEqual(ctx.exported_bytes, 0)  # no export attempted
 
     def test_dedup_by_hash_retains_observations(self):
         ctx = run_ctx(self.s, self.tmp.name)

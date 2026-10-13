@@ -23,8 +23,11 @@ selected boundaries:
 
 Candidate pipeline per buffer: bounded prefix read -> DEX magic + header
 validation (recognized version, header/file sizes, endian tag, section
-offset/length bounds) -> bounded full export -> full validation on the
-completed artifact (file size, Adler-32 checksum, SHA-1 signature).
+offset/length bounds; DEX 041's container format is recognized but
+reported unsupported) -> export bounded to the validated DEX extent (the
+header file_size, so run/candidate byte budgets cover the actual copy) ->
+full validation on the completed artifact (file size, Adler-32 checksum,
+SHA-1 signature).
 Magic-only match is a CANDIDATE, never a recovered executable. Shannon
 entropy is recorded as optional evidence only: it neither promotes a
 candidate nor rejects a valid DEX.
@@ -163,7 +166,10 @@ def dex_header_check(prefix: bytes) -> dict:
     field checks) against the DEX header spec. Magic + recognized version,
     header/file sizes, endian tag, and every present id/data section's
     offset+length bounds against the DECLARED file_size. A failure is a
-    decisive rejection of the candidate — never exported as a dump."""
+    decisive rejection of the candidate — never exported as a dump. DEX
+    041 is a distinct container format (0x78-byte header; offsets may
+    reference later data in the same container past file_size): recognized
+    but reported unsupported rather than misvalidated."""
     out: dict = {"result": "invalid", "errors": []}
     errors = out["errors"]
     if len(prefix) < 4 or prefix[:4] != DEX_MAGIC:
@@ -183,6 +189,11 @@ def dex_header_check(prefix: bytes) -> dict:
     if len(prefix) < HEADER_SIZE:
         errors.append(f"prefix of {len(prefix)} bytes is shorter than the "
                       f"{HEADER_SIZE}-byte header; structure unverifiable")
+        return out
+    if version == "041":
+        out["result"] = "unsupported"
+        errors.append("DEX 041 uses the container format (0x78-byte "
+                      "header, container-relative offsets); not supported")
         return out
 
     file_size = _u32(prefix, 0x20)
@@ -502,9 +513,10 @@ def process_buffer(session, ctx: RunContext, obj: int, *,
     header = assess["header"]
     rec["header"] = header
     if header["result"] != "valid":
-        # magic matched but the structure is decisively broken: rejected
-        # as a candidate, never exported as a dump
-        rec.update(outcome="invalid", errors=header["errors"])
+        # magic matched: a decisively broken structure is rejected as a
+        # candidate (never exported as a dump); a recognized but
+        # unsupported format (DEX 041) is reported as such
+        rec.update(outcome=header["result"], errors=header["errors"])
         return _emit(ctx, rec)
 
     expected = header["file_size"]
@@ -534,8 +546,14 @@ def process_buffer(session, ctx: RunContext, obj: int, *,
 
     dest = _export_path(session, ctx)
     try:
+        # export exactly the validated DEX extent (never the whole window:
+        # trailing bytes are not the payload, and the run/candidate byte
+        # budgets above are computed against `expected`); a window shorter
+        # than the declared file_size exports what exists and is reported
+        # truncated below
         res = session.export_buffer(
             obj, epoch, source=source, dest=str(dest),
+            length=min(expected, window),
             max_bytes=ctx.max_candidate_bytes, cancel=ctx.cancel)
     except ExportIncompleteError as e:
         rec.update(outcome="incomplete",

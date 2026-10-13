@@ -491,6 +491,61 @@ class IncompleteExportTests(unittest.TestCase):
         self.assertEqual(got, CORPUS[:len(got)])
         self.assertFalse(self.dest.exists())  # never published
 
+    def test_deadline_abort_preserves_byte_progress(self):
+        # 1 chunk of 1000 written before the deadline trips: the error's
+        # bytes_exported must match the retained partial file, not 0
+        c, oid = make_array_client()
+        clock = mock.Mock(side_effect=[0.0, 0.0, 10.0, 10.0, 10.0])
+        with mock.patch("apkdbg.debug.buffers.time.monotonic", clock):
+            with self.assertRaises(ExportIncompleteError) as cm:
+                BufferExporter(c, deadline_s=5.0, chunk_size=1000,
+                               keep_partial=True).export(oid, dest=self.dest)
+        e = cm.exception
+        self.assertEqual(e.context["bytes_exported"], 1000)
+        self.assertIn("1000/65536", str(e))
+        partial = Path(e.context["partial_file"])
+        self.assertEqual(partial.stat().st_size, 1000)
+        self.assertEqual(partial.read_bytes(), CORPUS[:1000])
+
+    def test_write_failure_mid_pump_preserves_byte_progress(self):
+        c, oid = make_array_client()
+        real_open = builtins.open
+        writes = {"n": 0}
+
+        class FlakyFile:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def write(self, data):
+                writes["n"] += 1
+                if writes["n"] > 1:
+                    raise OSError(errno.EIO, "I/O error")
+                return self._fh.write(data)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                self._fh.close()
+
+        def flaky_open(path, mode="r", *a, **kw):
+            fh = real_open(path, mode, *a, **kw)
+            if str(path).endswith(".part") and "w" in mode:
+                return FlakyFile(fh)
+            return fh
+
+        with mock.patch("builtins.open", flaky_open):
+            with self.assertRaises(ExportIncompleteError) as cm:
+                BufferExporter(c, chunk_size=1000, keep_partial=True).export(
+                    oid, dest=self.dest)
+        e = cm.exception
+        self.assertIn("host write failed", str(e))
+        self.assertEqual(e.context["bytes_exported"], 1000)
+        partial = Path(e.context["partial_file"])
+        self.assertEqual(partial.stat().st_size, 1000)
+        self.assertEqual(partial.read_bytes(), CORPUS[:1000])
+        self.assertFalse(self.dest.exists())
+
     def test_disconnect_mid_export_cleans_up(self):
         c, oid = make_array_client()
         c.fail_get_after = 2

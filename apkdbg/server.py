@@ -124,9 +124,11 @@ class RpcServer:
         return s is not None and s.client is not None
 
     # ------------------------------------------------------------ transport
-    def handle_line(self, line: str) -> list[dict]:
-        """One input line -> zero or more reply objects (zero only for
-        notifications / all-notification batches)."""
+    def handle_line(self, line: str) -> list:
+        """One input line -> zero or more output values: a plain request
+        yields its reply object, a batch yields ONE reply array (JSON-RPC
+        2.0 section 6). Zero only for notifications / all-notification
+        batches."""
         try:
             req = json.loads(line)
         except json.JSONDecodeError as e:
@@ -151,7 +153,7 @@ class RpcServer:
             return self._handle_v2(req)
         return self._handle_legacy(req)
 
-    def _handle_batch(self, items: list) -> list[dict]:
+    def _handle_batch(self, items: list) -> list:
         if not items:
             return [self._v2_error(None, INVALID_REQUEST,
                                    "batch must not be empty")]
@@ -164,7 +166,8 @@ class RpcServer:
                                        "batch elements must be JSON objects")
             if reply is not None:
                 replies.append(reply)
-        return replies
+        # one batch -> one reply array; an all-notification batch -> nothing
+        return [replies] if replies else []
 
     # ---------------------------------------------------------- legacy v1
     def _handle_legacy(self, req: dict) -> dict:
