@@ -767,8 +767,10 @@ class JdwpClient:
         w.u32(options)
         r = self.request(CS_OBJECTREF, OR_INVOKE, bytes(w.buf))
         val = r.value()
-        # per the JDWP spec the exception is a tagged-objectID; some
-        # agents emit it as a bare (untagged) objectID — tolerate both.
+        # spec: the exception is a TAGGED object (tag + objectID) in the
+        # standard InvokeMethod reply layout (jdwp-spec.html,
+        # ObjectReference.InvokeMethod). Tolerate a bare untagged
+        # objectID from non-conforming agents as a fallback.
         remaining = len(r.b) - r.p
         if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
             r.u8()  # skip the tag byte
@@ -871,8 +873,8 @@ class JdwpClient:
         w.u32(options)
         r = self.request(CS_CLASSTYPE, 4, bytes(w.buf))
         val = r.value()
-        # per the JDWP spec the exception is a tagged-objectID; some
-        # agents emit it as a bare (untagged) objectID — tolerate both.
+        # spec: tagged exception object (tag + objectID), as in
+        # InvokeMethod; tolerate a bare untagged objectID as a fallback
         remaining = len(r.b) - r.p
         if remaining == 1 + self.sizes.object and r.b[r.p] in OBJECT_TAGS:
             r.u8()

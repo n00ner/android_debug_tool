@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [master, develop, "fix/**", "feat/**"]
+  pull_request:
+
+# Offline suite only: no Android device or emulator is available (or
+# needed) in CI. tests/ is device-free; tests/integration/ requires an
+# attached device and is never collected by this workflow.
+
+jobs:
+  offline-suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]  # requires-python >=3.10
+        include:
+          - os: windows-latest
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build wheel
+        run: python -m pip wheel --no-deps -w dist .
+      - name: Install the built wheel
+        shell: bash
+        run: python -m pip install "$(ls dist/apkdbg-*.whl)"
+      - name: Run offline regression suite
+        shell: bash  # -eo pipefail is the runner default for bash
+        run: python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.os }}-py${{ matrix.python }}
+          path: test-output.txt
+          retention-days: 14
