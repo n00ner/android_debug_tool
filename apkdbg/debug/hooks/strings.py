@@ -672,6 +672,11 @@ def run_watch(session, profiles=None, mode: str = "attributed", *,
             errors.append(f"capture: {str(e)[:120]}")
             cfg["_stats"]["dropped"] += 1
             return
+        # the read budget counts reads, not just emitted records: filtered
+        # or deduplicated extractions (rec=None) exhaust it too, so check
+        # after every extraction attempt, before the rec=None return
+        if cfg["_stats"]["reads"] >= max_reads:
+            cfg["_stop"] = "max_reads"
         if rec is None:
             return
         records.append(rec)
@@ -680,9 +685,7 @@ def run_watch(session, profiles=None, mode: str = "attributed", *,
             on_record(rec)
         # budgets apply mid-composite too: once exhausted, further events
         # of the batch are counted dropped (not read) and the loop stops
-        if cfg["_stats"]["reads"] >= max_reads:
-            cfg["_stop"] = "max_reads"
-        elif len(records) >= max_events:
+        if cfg["_stop"] is None and len(records) >= max_events:
             cfg["_stop"] = "max_events"
         if store is not None:
             event_id = store.add_event(

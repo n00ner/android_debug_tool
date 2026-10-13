@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .core.aliases import AliasStore, accepted_alias_map
 from .core.init_pipeline import run_init
+from .core.capabilities import collect as collect_capabilities, index_facts
 from .core.manifests import RunStore, capture_environment
 from .core.project import Project
 from .debug.aliascollect import AliasCollector
@@ -86,6 +87,20 @@ def cmd_init(ctx: Ctx | None, apk: str, out: str = ".",
 
 
 # ------------------------------------------------------------------- queries
+def _index_note(db, count: int) -> dict | None:
+    """Precise explanation when a query comes back empty: distinguish 'the
+    index genuinely has no such rows' from 'the index is incomplete'."""
+    if count:
+        return None
+    facts = index_facts(db)
+    note = {"table_empty": True, "index_complete": facts["complete"],
+            "line_map": facts["line_map"],
+            "hint": "run 'capabilities' for the full index/capability report"}
+    if facts["warnings"]:
+        note["warnings"] = facts["warnings"][:5]
+    return note
+
+
 def cmd_classes(ctx: Ctx, filter: str = "", limit: int = 50,
                 offset: int = 0) -> dict:
     limit, offset = _page(limit, offset)
@@ -100,9 +115,13 @@ def cmd_classes(ctx: Ctx, filter: str = "", limit: int = 50,
         # accepted runtime aliases (issue #25): additive annotation next to
         # fqcn/deobf_fqcn — the original sig/fqcn identity is untouched
         aliases = accepted_alias_map(db, [r["sig"] for r in rows])
+        note = _index_note(db, total)
     for r in rows:
         r["alias"] = aliases.get(r["sig"])
-    return {"classes": rows, **_page_meta(rows, total, limit, offset)}
+    out = {"classes": rows, **_page_meta(rows, total, limit, offset)}
+    if note:
+        out["index_note"] = note
+    return out
 
 
 def cmd_methods(ctx: Ctx, class_: str, limit: int = 100,
@@ -118,7 +137,11 @@ def cmd_methods(ctx: Ctx, class_: str, limit: int = 100,
         total = db.one(
             "SELECT COUNT(*) AS n FROM methods m JOIN classes c ON "
             "c.id=m.class_id " + where, args)["n"]
-    return {"methods": rows, **_page_meta(rows, total, limit, offset)}
+        note = _index_note(db, total)
+    out = {"methods": rows, **_page_meta(rows, total, limit, offset)}
+    if note:
+        out["index_note"] = note
+    return out
 
 
 def cmd_res(ctx: Ctx, name: str | None = None,
@@ -127,15 +150,23 @@ def cmd_res(ctx: Ctx, name: str | None = None,
     with ctx.project.db() as db:
         if id:
             rid = int(id, 16) if id.startswith("0x") else int(id)
-            return {"resource": db.one(
-                "SELECT * FROM resources WHERE res_id=?", (rid,))}
+            row = db.one("SELECT * FROM resources WHERE res_id=?", (rid,))
+            out = {"resource": row}
+            note = _index_note(db, 1 if row else 0)
+            if note:
+                out["index_note"] = note
+            return out
         limit, offset = _page(limit, offset)
         rows = db.query(
             "SELECT * FROM resources WHERE name LIKE ? LIMIT ? OFFSET ?",
             (f"%{name or ''}%", limit, offset))
         total = db.one("SELECT COUNT(*) AS n FROM resources "
                        "WHERE name LIKE ?", (f"%{name or ''}%",))["n"]
-    return {"resources": rows, **_page_meta(rows, total, limit, offset)}
+        note = _index_note(db, total)
+    out = {"resources": rows, **_page_meta(rows, total, limit, offset)}
+    if note:
+        out["index_note"] = note
+    return out
 
 
 def cmd_res_refs(ctx: Ctx, id: str,  # noqa: A002
@@ -150,8 +181,21 @@ def cmd_res_refs(ctx: Ctx, id: str,  # noqa: A002
             "WHERE r.res_id=? LIMIT ? OFFSET ?", (rid, limit, offset))
         total = db.one("SELECT COUNT(*) AS n FROM resource_refs r "
                        "WHERE r.res_id=?", (rid,))["n"]
-    return {"res_id": hex(rid), "refs": rows,
-            **_page_meta(rows, total, limit, offset)}
+        note = _index_note(db, total)
+    out = {"res_id": hex(rid), "refs": rows,
+           **_page_meta(rows, total, limit, offset)}
+    if note:
+        out["index_note"] = note
+    return out
+
+
+# -------------------------------------------------------------- capabilities
+def cmd_capabilities(ctx: Ctx, probe: bool = False) -> dict:
+    """Offline capability matrix for this project/APK. With probe=True, adds
+    live (transient) observations: device/process presence, JDWP attach,
+    runtime line-table availability."""
+    return collect_capabilities(ctx.project, probe_live=probe,
+                                serial=ctx.serial)
 
 
 # ------------------------------------------------------------------- session
@@ -767,6 +811,7 @@ COMMANDS = {
     "methods": cmd_methods,
     "res": cmd_res,
     "res_refs": cmd_res_refs,
+    "capabilities": cmd_capabilities,
     "connect": cmd_connect,
     "restore": cmd_restore,
     "bp": cmd_bp,
