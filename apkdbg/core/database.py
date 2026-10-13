@@ -110,9 +110,11 @@ CREATE TABLE IF NOT EXISTS coverage_hits (
   run_id      TEXT NOT NULL,
   class_sig   TEXT,
   method_name TEXT,
+  method_sig  TEXT,               -- full descriptor: ()V — overloads stay
+                                  -- separate rows (issue #37)
   dalvik_line INTEGER,
   hits        INTEGER DEFAULT 0,
-  UNIQUE(run_id, class_sig, method_name, dalvik_line)
+  UNIQUE(run_id, class_sig, method_name, method_sig, dalvik_line)
 );
 
 -- investigation run manifests (issue #36): durable identity for runtime
@@ -243,6 +245,29 @@ class MappingDB:
                 "INSERT OR IGNORE INTO meta(key,value)"
                 " VALUES('index_version',?)", (str(INDEX_VERSION),))
             self.conn.commit()
+        self._migrate_coverage_hits()
+
+    def _migrate_coverage_hits(self) -> None:
+        """Issue #37: pre-#37 coverage_hits has no method_sig column and a
+        unique key that merges overloads. Rebuild the table additively —
+        legacy rows carry method_sig NULL, nothing is dropped."""
+        cols = {r["name"] for r in
+                self.conn.execute("PRAGMA table_info(coverage_hits)")}
+        if not cols or "method_sig" in cols:
+            return
+        self.conn.executescript(
+            "ALTER TABLE coverage_hits RENAME TO coverage_hits_legacy;"
+            "CREATE TABLE coverage_hits ("
+            " id INTEGER PRIMARY KEY, run_id TEXT NOT NULL,"
+            " class_sig TEXT, method_name TEXT, method_sig TEXT,"
+            " dalvik_line INTEGER, hits INTEGER DEFAULT 0,"
+            " UNIQUE(run_id, class_sig, method_name, method_sig,"
+            " dalvik_line));"
+            "INSERT INTO coverage_hits(id,run_id,class_sig,method_name,"
+            "dalvik_line,hits) SELECT id,run_id,class_sig,method_name,"
+            "dalvik_line,hits FROM coverage_hits_legacy;"
+            "DROP TABLE coverage_hits_legacy;")
+        self.conn.commit()
 
     def execute(self, sql: str, params=()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)

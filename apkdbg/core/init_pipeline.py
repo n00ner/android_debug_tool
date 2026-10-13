@@ -351,7 +351,17 @@ def _copy_observations(staging: MappingDB, live_db_path: Path) -> None:
         "SELECT name FROM live.sqlite_master WHERE type='table'")}
     for t in OBSERVATION_TABLES:
         if t in live_tables:
-            staging.execute(f"INSERT INTO {t} SELECT * FROM live.{t}")
+            # column intersection: a live DB written by an older apkdbg may
+            # lack newer additive columns (e.g. coverage_hits.method_sig,
+            # issue #37); new columns keep their defaults for carried rows
+            cols = [r["name"] for r in
+                    staging.query(f"PRAGMA table_info({t})")]
+            live_cols = {r["name"] for r in
+                         staging.query(f"PRAGMA live.table_info({t})")}
+            use = [c for c in cols if c in live_cols]
+            colist = ",".join(use)
+            staging.execute(
+                f"INSERT INTO {t} ({colist}) SELECT {colist} FROM live.{t}")
     # no explicit DETACH: it cannot run inside the open transaction; the
     # attached handle is released when the staging connection closes
 

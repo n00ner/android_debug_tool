@@ -508,7 +508,7 @@ class CoverageConsumerTests(unittest.TestCase):
         rep = CoverageTracker(s, ["com.foo"], mode="method",
                               seconds=5).run()
         self.assertEqual(rep["events"], 1)
-        self.assertEqual(rep["methods"], {"Lcom/foo/A;->m": 1})
+        self.assertEqual(rep["methods"], {"Lcom/foo/A;->m()V": 1})
         self.assertEqual(c.cleared, [(EVK_METHOD_ENTRY, 1)])
         self.assertEqual(c.resumed, [])  # SP_NONE never resumes
         self.assertEqual(s.bp_registry, {})

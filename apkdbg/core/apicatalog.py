@@ -382,7 +382,10 @@ _META: dict[str, dict] = {
     },
     "coverage": {
         "summary": "method- or line-level coverage for the given packages",
-        "result": "hit tables with budget/truncation metadata",
+        "result": "hit tables keyed by full method identity "
+                  "(class->name(descriptor)) with bytecode-offset evidence, "
+                  "branch edges vs site hits, unknown reasons, and "
+                  "budget/truncation metadata",
         "mutates": True, "idempotent": False, "retryable": False,
         "project": True, "session": True,
         "params": {"packages": "package prefixes to instrument",
