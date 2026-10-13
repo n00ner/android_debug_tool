@@ -215,6 +215,22 @@ class ValidateTests(unittest.TestCase):
         c, _ = make_client()
         c.validate_instance_method(ACTIVITY, GETINTENT, obj=OBJ_MAIN)
 
+    def test_validate_returns_declaring_class(self):
+        c, _ = make_client()
+        self.assertEqual(
+            c.validate_instance_method(MAIN, GETINTENT, obj=OBJ_MAIN),
+            ACTIVITY)
+        self.assertEqual(
+            c.validate_instance_method(ACTIVITY, GETINTENT, obj=OBJ_MAIN),
+            ACTIVITY)
+        self.assertEqual(
+            c.validate_instance_method(MAIN, ONCREATE, obj=OBJ_MAIN),
+            MAIN)
+        self.assertEqual(
+            c.validate_instance_method(MAIN, ONCREATE, obj=OBJ_MAIN,
+                                       nonvirtual=True),
+            MAIN)
+
     def test_unrelated_method_id_rejected(self):
         c, _ = make_client()
         with self.assertRaises(ResolveError):
@@ -251,6 +267,29 @@ class ValidateTests(unittest.TestCase):
 
 
 class CheckedInvokeTests(unittest.TestCase):
+    def test_ancestor_method_sends_declaring_class_on_wire(self):
+        # reviewer scenario: (MAIN, GETINTENT) passes validation but the
+        # packet must carry ACTIVITY, the declaring class — sending
+        # (subclass, ancestor-method) disconnected ART on Android 15
+        c, stub = make_client()
+        s = c.sizes
+        c.invoke_object_method(OBJ_MAIN, THREAD, MAIN, GETINTENT, [])
+        self.assertEqual(len(stub.invoke_payloads), 1)
+        p = stub.invoke_payloads[0]
+        (obj, thread, cls, mid), _ = parse_ids(
+            p, [s.object, s.object, s.reftype, s.method])
+        self.assertEqual((obj, thread, cls, mid),
+                         (OBJ_MAIN, THREAD, ACTIVITY, GETINTENT))
+
+    def test_own_method_keeps_callers_class_on_wire(self):
+        c, stub = make_client()
+        s = c.sizes
+        c.invoke_object_method(OBJ_MAIN, THREAD, MAIN, ONCREATE, [])
+        p = stub.invoke_payloads[0]
+        (_, _, cls, mid), _ = parse_ids(
+            p, [s.object, s.object, s.reftype, s.method])
+        self.assertEqual((cls, mid), (MAIN, ONCREATE))
+
     def test_bad_method_id_rejected_before_any_invoke(self):
         c, stub = make_client()
         with self.assertRaises(ResolveError):
@@ -356,7 +395,7 @@ class EpochCacheTests(unittest.TestCase):
         self.assertEqual(c._rt_methods_cache, {})
         self.assertEqual(c._super_cache, {})
         self.assertEqual(c._resolve_cache, {})
-        self.assertEqual(c._pair_cache, set())
+        self.assertEqual(c._pair_cache, {})
 
 
 if __name__ == "__main__":
