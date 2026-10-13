@@ -59,3 +59,36 @@ python _validate.py <serial> 60 120
 `proj/` (apkdbg project DB) and `out/` (build intermediates) are
 generated and git-ignored; everything else — source, manifest, build
 script, signed APK, vectors, validator, and this report — is committed.
+
+## Issue #26 extension — string-watcher fixture paths
+
+`StringWork` (added for the `watch_strings` watcher) is triggered by the
+`com.apkdbg.cryptofixture.STRINGS` broadcast action and exercises:
+
+  - `decryptUrl()Ljava/lang/String;` — a selected decryptor method
+    returning the encrypted test URL `https://fixture.example/decrypted-url`
+    (XOR 0x5A at rest); the producer-return observation target, watched
+    with the custom profile
+    `{"cls":"Lcom/apkdbg/cryptofixture/StringWork;","method":"decryptUrl","sig":"()Ljava/lang/String;"}`;
+  - `viaBuilder(...)` — observed by the opt-in `stringbuilder.tostring`
+    profile;
+  - `viaNewString()` (`new String(byte[])`) and `viaReflection()`
+    (`String.valueOf(char[])` via `Method.invoke`) — constructed WITHOUT
+    StringBuilder: the documented bypass paths. A StringBuilder watcher
+    must NOT report these; their absence from `stringbuilder.tostring`
+    results is the expected, documented non-coverage, not a miss.
+
+`com.apkdbg.cryptofixture.BENCH` (extra `iters`, default 200000) runs
+`StringWork.hotLoop` — the benchmark workload for
+`test_scope/_pr26_bench.py` (event rate + workload slowdown for
+disabled / best_effort / attributed capture).
+
+Rebuild after touching `src/`:
+
+```bash
+./build.sh                                   # rebuild + sign the APK
+echo | apktool.bat d -f -o proj/apktool crypto_fixture.apk   # refresh smali
+adb -s <serial> install -r crypto_fixture.apk
+adb -s <serial> shell am broadcast -a com.apkdbg.cryptofixture.STRINGS \
+    -p com.apkdbg.cryptofixture
+```
