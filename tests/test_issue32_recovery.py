@@ -19,7 +19,8 @@ from apkdbg.device.jdwp import (
     JdwpError,
 )
 from apkdbg.errors import (
-    OutcomeUnknownError, ProcessDiedError, SessionError, StaleHandleError,
+    AttachUnavailableError, OutcomeUnknownError, ProcessDiedError,
+    SessionError, StaleHandleError,
 )
 
 HOOK = "Cipher.doFinal()"
@@ -571,7 +572,7 @@ class ScopedRecoveryTests(unittest.TestCase):
     def test_attach_never_escalates_to_kill_server_by_default(self):
         s = make_session(Conn("127.0.0.1", 7777))
         with reset_conn(fail=True):           # plain + reconnect both fail
-            with self.assertRaises(JdwpConnError):
+            with self.assertRaises(AttachUnavailableError):
                 s._attach()
         self.assertEqual(len(s.adb.calls("reconnect")), 1)
         self.assertEqual(s.adb.calls("kill_server"), [])
@@ -579,7 +580,7 @@ class ScopedRecoveryTests(unittest.TestCase):
     def test_kill_server_only_when_explicitly_requested(self):
         s = make_session(Conn("127.0.0.1", 7777))
         with reset_conn(fail=True):
-            with self.assertRaises(JdwpConnError):
+            with self.assertRaises(AttachUnavailableError):
                 s._attach(allow_global_restart=True)
         self.assertEqual(len(s.adb.calls("reconnect")), 1)
         self.assertEqual(len(s.adb.calls("kill_server")), 1)
