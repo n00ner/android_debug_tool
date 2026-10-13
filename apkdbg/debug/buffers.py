@@ -103,6 +103,7 @@ class BufferExporter:
         self.capped = capped
         self.requests = 0
         self.chunks = 0
+        self.exported = 0
         self._t0 = 0.0
 
     # ------------------------------------------------------------ entrypoint
@@ -135,14 +136,14 @@ class BufferExporter:
             os.replace(tmp, dest)
         except _Abort as e:
             self._cleanup(tmp)
-            raise self._incomplete(str(e), total, done, tmp)
+            raise self._incomplete(str(e), total, self.exported, tmp)
         except KeyboardInterrupt:
             self._cleanup(tmp)
-            raise self._incomplete("cancelled", total, done, tmp)
+            raise self._incomplete("cancelled", total, self.exported, tmp)
         except OSError as e:
             self._cleanup(tmp)
-            raise self._incomplete(f"host write failed: {e}", total, done,
-                                   tmp) from e
+            raise self._incomplete(f"host write failed: {e}", total,
+                                   self.exported, tmp) from e
         except Exception:
             # JDWP disconnect/reply errors propagate with their own
             # structured code; the partial file policy still applies.
@@ -410,6 +411,7 @@ class BufferExporter:
             fh.write(data)
             sha.update(data)
             done += n
+            self.exported = done
             self.chunks += 1
         return done
 
