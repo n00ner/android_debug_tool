@@ -4,6 +4,7 @@ Each function takes a Ctx plus kwargs and returns a JSON-native dict."""
 from __future__ import annotations
 
 import json
+import uuid
 from pathlib import Path
 
 from .core.aliases import AliasStore, accepted_alias_map
@@ -20,7 +21,7 @@ from .debug.hooks import strings as string_hooks
 from .debug.session import DebugSession
 from .debug.snapdiff import snapshot_diff
 from .debug.snapshot import Budgets, Snapshotter
-from .errors import SessionError
+from .errors import ExportIncompleteError, SessionError
 
 
 # ------------------------------------------------------------- pagination
@@ -501,6 +502,71 @@ def cmd_snapshot_diff(ctx: Ctx, a: str, b: str, force: bool = False) -> dict:
     return snapshot_diff(RunStore(ctx.project), a, b, force=force)
 
 
+# ------------------------------------------------- buffer export (issue #38)
+def cmd_export_buffer(ctx: Ctx, obj: int, epoch: int, source: str = "auto",
+                      offset: int | None = None, length: int | None = None,
+                      dest: str | None = None,
+                      max_bytes: int = 16 << 20, chunk_size: int = 1 << 16,
+                      deadline: float | None = None, capped: bool = False,
+                      keep_partial: bool = False, record: bool = False,
+                      run_id: str | None = None, scenario: str | None = None,
+                      event_id: str | None = None) -> dict:
+    """Bounded binary export of a byte[] or heap ByteBuffer (pure reads, no
+    target mutation). offset/length are array indices for arrays and
+    relative to the buffer position for ByteBuffers (default range:
+    [position, limit)). dest defaults to <project>/exports/buffer-<id>.bin;
+    bytes go to a temp file published by atomic rename on success. With
+    record/run_id the export metadata (sha256, byte count, source range,
+    completeness) is persisted as a run artifact referencing the file.
+    Incomplete outcomes (deadline/disconnect/disk-full) remove the partial
+    temp file unless keep_partial and are never reported as complete."""
+    if dest is None:
+        dest = str(ctx.project.root / "exports"
+                   / f"buffer-{uuid.uuid4().hex[:12]}.bin")
+    session = ctx.session
+    store = RunStore(ctx.project) if (record or run_id) else None
+    own_run = run_id is None
+    if store and own_run:
+        run_id = store.begin_run(
+            "buffer_export",
+            capture_config={"obj": obj, "epoch": epoch, "source": source,
+                            "offset": offset, "length": length,
+                            "max_bytes": max_bytes, "chunk_size": chunk_size,
+                            "capped": capped},
+            scenario=scenario, epoch=session.events.epoch,
+            environment=capture_environment(session))
+    try:
+        res = session.export_buffer(
+            obj, epoch, source=source, offset=offset, length=length,
+            dest=dest, max_bytes=max_bytes, chunk_size=chunk_size,
+            deadline=deadline, capped=capped, keep_partial=keep_partial)
+    except ExportIncompleteError as e:
+        if store:
+            store.add_artifact(
+                run_id, "buffer_export",
+                {"complete": False, "file": e.context.get("partial_file"),
+                 "error": e.to_dict()},
+                format="json", errors=[e.to_dict()],
+                parent_event_id=event_id, epoch=session.events.epoch)
+        if store and own_run:
+            store.end_run(run_id, "failed")
+        raise
+    except Exception:
+        if store and own_run:
+            store.end_run(run_id, "failed")
+        raise
+    if store:
+        res["artifact_id"] = store.add_artifact(
+            run_id, "buffer_export", res, format="json",
+            parent_event_id=event_id, epoch=session.events.epoch)
+        res["run_id"] = run_id
+        if own_run:
+            store.end_run(run_id, "completed",
+                          counts={"bytes": res["bytes"]["exported"]})
+    res["epoch"] = session.events.epoch
+    return res
+
+
 # -------------------------------------------------------- aliases (issue #25)
 def cmd_aliases(ctx: Ctx, action: str = "list",
                 candidate_id: str | None = None,
@@ -605,6 +671,7 @@ COMMANDS = {
     "coverage": cmd_coverage,
     "runs": cmd_runs,
     "snapshot_diff": cmd_snapshot_diff,
+    "export_buffer": cmd_export_buffer,
     "aliases": cmd_aliases,
     "native": cmd_native,
 }

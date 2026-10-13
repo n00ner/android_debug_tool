@@ -65,7 +65,7 @@ from ..errors import (
     ProcessDiedError, ResolveError, SessionError, StaleHandleError,
 )
 from ..protocol import log_progress
-from . import translate
+from . import buffers, translate
 from .dispatcher import EventDispatcher
 
 STEP_KINDS = {"into": STEP_INTO, "over": STEP_OVER, "out": STEP_OUT}
@@ -581,6 +581,33 @@ class DebugSession:
             return {"slot": slot_n, "tag": tag, "written": value}
         return self._op(do, _class=OP_STATE, _name="write_var",
                         _handles=True)
+
+    # ------------------------------------------------- buffer export (issue #38)
+    def export_buffer(self, obj: int, epoch: int, *, source: str = "auto",
+                      offset: int | None = None, length: int | None = None,
+                      dest, max_bytes: int = buffers.DEFAULT_MAX_BYTES,
+                      chunk_size: int = buffers.DEFAULT_CHUNK_SIZE,
+                      deadline: float | None = None, capped: bool = False,
+                      keep_partial: bool = False) -> dict:
+        """Bounded binary export of a byte[] / heap ByteBuffer (pure reads).
+        The caller must pass the connection epoch the handle came from: a
+        mismatch is a stale handle and fails BEFORE any read or file."""
+        if epoch != self.events.epoch:
+            raise StaleHandleError(
+                "export_buffer", epoch=epoch,
+                hint=f"the current connection epoch is {self.events.epoch}; "
+                     "re-acquire a fresh object handle from new events and "
+                     "pass that epoch")
+        def do(c: JdwpClient):
+            return buffers.BufferExporter(
+                c, chunk_size=chunk_size, max_bytes=max_bytes,
+                deadline_s=deadline, keep_partial=keep_partial,
+                capped=capped).export(
+                obj, source=source, offset=offset, length=length, dest=dest)
+        # read-only, but the object handle is a numeric id of the current
+        # epoch: after a reconnect the caller gets StaleHandleError, never
+        # bytes from an unrelated object that reused the id (issue #32)
+        return self._op(do, _class=OP_READ, _name="export_buffer")
 
     # ----------------------------------------------------------------- invoke
     def invoke(self, thread: int, obj: int, method: str, sig: str,

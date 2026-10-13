@@ -323,6 +323,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("native", help="list native methods + lldb plan")
 
+    sp = sub.add_parser("export_buffer",
+                        help="bounded export of a byte[] / heap ByteBuffer "
+                             "(issue #38)")
+    sp.add_argument("--obj", type=int, required=True,
+                    help="object handle of the array or ByteBuffer")
+    sp.add_argument("--epoch", type=int, required=True,
+                    help="connection epoch the handle came from (stale "
+                         "handles fail before any read)")
+    sp.add_argument("--source", default="auto",
+                    choices=["auto", "array", "bytebuffer"])
+    sp.add_argument("--offset", type=int,
+                    help="array index / offset relative to the buffer "
+                         "position (default 0)")
+    sp.add_argument("--length", type=int,
+                    help="bytes to export (default: to the array end / "
+                         "buffer limit)")
+    sp.add_argument("--dest", help="destination file (default: "
+                                   "<project>/exports/buffer-<id>.bin)")
+    sp.add_argument("--max-bytes", type=int, default=16 << 20)
+    sp.add_argument("--chunk-size", type=int, default=1 << 16)
+    sp.add_argument("--deadline", type=float,
+                    help="abort the export after this many seconds")
+    sp.add_argument("--capped", action="store_true",
+                    help="deliberate bounded preview: export at most "
+                         "--max-bytes of an over-long range (reported as "
+                         "a capped, incomplete export)")
+    sp.add_argument("--keep-partial", action="store_true",
+                    help="retain the partial temp file on abort "
+                         "(default: removed)")
+    sp.add_argument("--record", action="store_true",
+                    help="persist export metadata as a run artifact")
+    sp.add_argument("--run-id", help="attach to an existing run")
+    sp.add_argument("--scenario")
+    sp.add_argument("--event-id", help="parent event for the artifact")
+    sp.add_argument("--pkg")
+
     sp = sub.add_parser("aliases", help="review runtime alias candidates "
                                         "(issue #25)")
     sp.add_argument("action",
@@ -355,7 +391,7 @@ def build_parser() -> argparse.ArgumentParser:
 SESSION_VERBS = {"bp", "bp_del", "bp_list", "events", "read_var", "write_var",
                  "invoke", "step", "resume", "restore", "snapshot",
                  "dump_object", "cond", "hook_crypto", "watch_strings",
-                 "watch_framework", "coverage", "native"}
+                 "watch_framework", "coverage", "native", "export_buffer"}
 
 
 def main(argv: list[str] | None = None) -> int:
