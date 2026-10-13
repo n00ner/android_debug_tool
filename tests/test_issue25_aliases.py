@@ -473,6 +473,86 @@ class AliasStoreTests(unittest.TestCase):
         self.assertEqual(after["deobf_fqcn"], CLASS_DEOBF)
 
 
+# -------------------------------------------- cross-APK supersede (review)
+class CrossApkSupersedeTests(unittest.TestCase):
+    """Supersede is scoped to the candidate's own APK: accepting or adding
+    an alias for one APK must never supersede another APK's accepted alias
+    for the same obfuscated descriptor (review feedback on PR #48)."""
+
+    APK_B_SHA = "b" * 64
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proj = make_project(self.tmp.name)
+        self.store = AliasStore(self.proj)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def observe(self, text="PaymentRepository", **kw):
+        kw.setdefault("class_sig", CLASS_SIG)
+        return self.store.observe(candidate=text, score=0.8, rule="log_tag",
+                                  **kw)
+
+    def switch_apk(self, sha):
+        with self.proj.db() as db:
+            db.set_meta("sha256", sha)
+
+    def test_accept_never_supersedes_another_apks_alias(self):
+        a, _ = self.observe("PaymentRepository")
+        self.store.accept(a)
+        # same obfuscated descriptor in a different APK build
+        self.switch_apk(self.APK_B_SHA)
+        b, _ = self.observe("BillingRepo")
+        out = self.store.accept(b)
+        self.assertEqual(out["superseded"], [])       # nothing superseded
+        self.assertEqual(self.store.get(a)["status"], "accepted")
+        rows = self.store.list(all_apks=True)["candidates"]
+        self.assertEqual(
+            {r["candidate_id"]: r["status"] for r in rows},
+            {a: "accepted", b: "accepted"})
+        self.assertEqual({r["apk_sha256"] for r in rows},
+                         {APK_SHA, self.APK_B_SHA})
+        # scoped lookup: each APK resolves its own alias
+        with self.proj.db() as db:
+            self.assertEqual(accepted_alias(db, CLASS_SIG), "BillingRepo")
+        self.switch_apk(APK_SHA)
+        with self.proj.db() as db:
+            self.assertEqual(accepted_alias(db, CLASS_SIG),
+                             "PaymentRepository")
+
+    def test_manual_add_never_supersedes_another_apks_alias(self):
+        a, _ = self.observe("PaymentRepository")
+        self.store.accept(a)
+        self.switch_apk(self.APK_B_SHA)
+        out = self.store.add_alias(CLASS_SIG, "BillingRepo")
+        self.assertEqual(out["superseded"], [])
+        self.assertEqual(self.store.get(a)["status"], "accepted")
+        rows = self.store.list(all_apks=True, status="accepted")
+        self.assertEqual(rows["total"], 2)
+
+    def test_accepting_historical_candidate_supersedes_only_its_own_apk(self):
+        # APK A accepts an alias; APK B accepts one for the same descriptor
+        a1, _ = self.observe("PaymentRepository")
+        self.store.accept(a1)
+        self.switch_apk(self.APK_B_SHA)
+        b1, _ = self.observe("BillingRepo")
+        self.store.accept(b1)
+        # back on APK A: a new candidate accepted there supersedes a1 but
+        # must not touch B's accepted alias
+        self.switch_apk(APK_SHA)
+        a2, _ = self.observe("PaymentRepo")
+        out = self.store.accept(a2)
+        self.assertEqual(out["superseded"], [a1])
+        self.assertEqual(self.store.get(a1)["status"], "superseded")
+        self.assertEqual(self.store.get(b1)["status"], "accepted")
+        # revising a historical (APK A) candidate scopes to APK A as well:
+        # the superseded list is only the revised row itself
+        out = self.store.revise(a2, "PaymentStore")
+        self.assertEqual(out["superseded"], [a2])
+        self.assertEqual(self.store.get(b1)["status"], "accepted")
+
+
 # ------------------------------------------------------------- collector
 class CollectorTests(unittest.TestCase):
     def setUp(self):

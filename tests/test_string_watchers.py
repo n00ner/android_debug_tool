@@ -629,6 +629,57 @@ class RunWatchTests(unittest.TestCase):
         self.assertEqual(out["counts"]["matched"], 1)
         self.assertGreaterEqual(out["counts"]["dropped"], 1)
 
+    def test_max_reads_counts_regex_filtered_events(self):
+        # a hot stream of filtered strings must exhaust the read budget:
+        # reads are counted, not just emitted records
+        c = dec_client()
+        c.strings.update({8000 + i: "discard" for i in range(10)})
+        s = make_session(c)
+        reads = []
+        orig = c.string_value
+
+        def counting(oid, max_len=4096):
+            reads.append(oid)
+            return orig(oid, max_len)
+        c.string_value = counting
+        events = [([lambda rid, i=i: exit_event(rid, ret=str_ret(8000 + i))
+                    for i in range(10)], SP_EVENT_THREAD)]
+        with self._queued_watch(c, events):
+            out = strings.run_watch(s, profiles=[DEC_PROF], duration_s=30,
+                                    max_reads=2, text_regex="keep")
+        self.assertEqual(out["reason"], "max_reads")
+        self.assertEqual(out["counts"]["reads"], 2)
+        self.assertEqual(len(reads), 2)  # no JDWP reads past the budget
+        self.assertEqual(out["counts"]["filtered"], 2)
+        self.assertEqual(out["counts"]["dropped"], 8)
+        self.assertEqual(out["counts"]["matched"], 0)
+        self.assertEqual(out["records"], [])
+
+    def test_max_reads_counts_deduped_events(self):
+        # repeated strings: the duplicate's read consumes the budget too
+        c = dec_client()
+        c.strings.update({8000 + i: "same text" for i in range(10)})
+        s = make_session(c)
+        reads = []
+        orig = c.string_value
+
+        def counting(oid, max_len=4096):
+            reads.append(oid)
+            return orig(oid, max_len)
+        c.string_value = counting
+        events = [([lambda rid, i=i: exit_event(rid, ret=str_ret(8000 + i))
+                    for i in range(10)], SP_EVENT_THREAD)]
+        with self._queued_watch(c, events):
+            out = strings.run_watch(s, profiles=[DEC_PROF], duration_s=30,
+                                    max_reads=2)
+        self.assertEqual(out["reason"], "max_reads")
+        self.assertEqual(out["counts"]["reads"], 2)
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(out["counts"]["matched"], 1)
+        self.assertEqual(out["counts"]["deduped"], 1)
+        self.assertEqual(out["counts"]["dropped"], 8)
+        self.assertEqual(len(out["records"]), 1)
+
     def test_max_output_bytes_truncation(self):
         c = dec_client()
         c.strings[8001] = "payload"

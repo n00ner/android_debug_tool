@@ -50,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("res_refs", help="call sites of a resource id")
     sp.add_argument("--id", required=True)
 
+    sp = sub.add_parser("capabilities",
+                        help="capability matrix for this APK (offline; "
+                             "--probe adds live device/JDWP observations)")
+    sp.add_argument("--probe", action="store_true")
+
     sp = sub.add_parser("connect", help="attach JDWP to app")
     sp.add_argument("--pkg")
     sp.add_argument("--launch", action="store_true")

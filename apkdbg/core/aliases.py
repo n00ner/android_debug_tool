@@ -189,8 +189,8 @@ class AliasStore:
         now = _now()
         with self.project.db() as db:
             superseded = self._supersede_accepted(
-                db, class_sig, method_name, method_sig, None,
-                replaced_by="manual alias")
+                db, db.get_meta("sha256"), class_sig, method_name,
+                method_sig, None, replaced_by="manual alias")
             cid = uuid.uuid4().hex
             db.execute(
                 "INSERT INTO alias_candidates(candidate_id,apk_sha256,"
@@ -215,8 +215,9 @@ class AliasStore:
                 return {"candidate_id": candidate_id, "status": "accepted",
                         "superseded": [], "note": "already accepted"}
             superseded = self._supersede_accepted(
-                db, row["class_sig"], row["method_name"], row["method_sig"],
-                row["classloader_key"], replaced_by=candidate_id)
+                db, row["apk_sha256"], row["class_sig"], row["method_name"],
+                row["method_sig"], row["classloader_key"],
+                replaced_by=candidate_id)
             db.execute(
                 "UPDATE alias_candidates SET status='accepted', decided_at=?"
                 " WHERE candidate_id=?", (_now(), candidate_id))
@@ -248,9 +249,9 @@ class AliasStore:
             if row["candidate"] == new_text:
                 return self.accept(candidate_id, note=note)
             superseded = self._supersede_accepted(
-                db, row["class_sig"], row["method_name"], row["method_sig"],
-                row["classloader_key"], replaced_by="revision",
-                exclude=candidate_id)
+                db, row["apk_sha256"], row["class_sig"], row["method_name"],
+                row["method_sig"], row["classloader_key"],
+                replaced_by="revision", exclude=candidate_id)
             new_id = uuid.uuid4().hex
             db.execute(
                 "INSERT INTO alias_candidates(candidate_id,apk_sha256,"
@@ -382,18 +383,20 @@ class AliasStore:
                                hint="see `aliases list`")
         return row
 
-    def _supersede_accepted(self, db, class_sig, method_name, method_sig,
-                            classloader_key, *, replaced_by: str,
+    def _supersede_accepted(self, db, apk_sha256, class_sig, method_name,
+                            method_sig, classloader_key, *, replaced_by: str,
                             exclude: str | None = None) -> list:
         """Move every OTHER accepted candidate of the same entity (same
-        class/method/classloader scope — loaders are never merged) to
-        superseded; returns their ids."""
+        APK, class/method/classloader scope — loaders are never merged, and
+        a different APK's aliases are never touched) to superseded;
+        returns their ids."""
         now = _now()
         others = db.query(
             "SELECT candidate_id, status FROM alias_candidates WHERE "
-            "status='accepted' AND class_sig=? AND method_name IS ? AND "
-            "method_sig IS ? AND classloader_key IS ?",
-            (class_sig, method_name, method_sig, classloader_key))
+            "status='accepted' AND apk_sha256 IS ? AND class_sig=? AND "
+            "method_name IS ? AND method_sig IS ? AND classloader_key IS ?",
+            (apk_sha256, class_sig, method_name, method_sig,
+             classloader_key))
         done = []
         for o in others:
             if o["candidate_id"] == exclude:

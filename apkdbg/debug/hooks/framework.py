@@ -372,12 +372,13 @@ def install(session, profiles: list, mode: str = "attributed", *,
     unsupported (native, or abstract/interface-only) / failed. Overloads
     match by exact (name, sig); defer=True arms a CLASS_PREPARE watch that
     auto-installs exactly once per classloader instance — the path for
-    late-loaded custom implementations."""
+    late-loaded custom implementations, and for concrete alternatives
+    (e.g. the AOSP editor impl) when only the abstract primary type
+    (interface) is loaded."""
     if mode not in MODES:
         raise SessionError(f"unknown capture mode {mode!r}",
                            hint=" | ".join(MODES))
     sp = SP_NONE if mode == "best_effort" else SP_EVENT_THREAD
-    d = session.events
     installed, pending, deferred = [], [], []
     states = {}
     for spec in profiles:
@@ -389,10 +390,8 @@ def install(session, profiles: list, mode: str = "attributed", *,
             pending.append({"profile": prof["name"], "state": "pending",
                             "reason": str(e)[:120]})
             if defer:
-                rid = d.defer_hook(
-                    OWNER, prof["name"], _class_pattern(prof["cls"]),
-                    _make_on_prepare(session, prof, sp, thread, mod_count))
-                deferred.append({"profile": prof["name"], "request_id": rid})
+                deferred.extend(
+                    _defer_unloaded(session, prof, sp, thread, mod_count))
             continue
         except (MethodNotFound, UnsupportedHook) as e:
             state = ("not-found" if isinstance(e, MethodNotFound)
@@ -400,6 +399,12 @@ def install(session, profiles: list, mode: str = "attributed", *,
             states[prof["name"]] = state
             pending.append({"profile": prof["name"], "state": state,
                             "reason": str(e)[:120]})
+            if defer and not isinstance(e, MethodNotFound):
+                # abstract/interface-only load (e.g. the SharedPreferences
+                # Editor interface): the concrete alternatives may still
+                # arrive — watch for the ones not loaded yet
+                deferred.extend(
+                    _defer_unloaded(session, prof, sp, thread, mod_count))
             continue
         except Exception as e:
             states[prof["name"]] = "failed"
@@ -414,6 +419,26 @@ def install(session, profiles: list, mode: str = "attributed", *,
             "note": "pending profiles: class not loaded yet; re-install "
                     "later or install with defer=True for CLASS_PREPARE "
                     "auto-install (custom/late-loaded implementations)"}
+
+
+def _defer_unloaded(session, prof: dict, sp: int, thread: int | None,
+                    mod_count: int | None) -> list:
+    """Arm CLASS_PREPARE watches for the profile's classes that are not
+    loaded yet — primary and concrete alternatives alike. The defer key
+    carries the sig so one profile can hold watches for several classes
+    (defer_hook dedupes per owner+key)."""
+    out = []
+    d = session.events
+    for sig in [prof["cls"], *prof.get("cls_alts", [])]:
+        if session.client.classes_by_signature(sig):
+            continue
+        key = (prof["name"] if sig == prof["cls"]
+               else f'{prof["name"]}@{sig}')
+        rid = d.defer_hook(
+            OWNER, key, _class_pattern(sig),
+            _make_on_prepare(session, prof, sp, thread, mod_count))
+        out.append({"profile": prof["name"], "request_id": rid})
+    return out
 
 
 def _install_one(session, prof: dict, sp: int, thread: int | None,

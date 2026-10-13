@@ -259,7 +259,7 @@ class BatchTests(unittest.TestCase):
         self.srv = RpcServer(NOPE_PROJECT)
 
     def test_mixed_batch(self):
-        replies = self.srv.handle_line(json.dumps([
+        batch, = self.srv.handle_line(json.dumps([
             {"jsonrpc": "2.0", "id": 1, "method": "describe",
              "params": {"command": "bp"}},
             {"jsonrpc": "2.0", "method": "describe"},      # notification
@@ -267,8 +267,9 @@ class BatchTests(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "nope"}, # method error
             42,                                            # invalid element
         ]))
-        self.assertEqual(len(replies), 4)  # notification omitted
-        r1, r2, r3, r4 = replies
+        self.assertIsInstance(batch, list)  # one reply array, not objects
+        self.assertEqual(len(batch), 4)  # notification omitted
+        r1, r2, r3, r4 = batch
         self.assertEqual((r1["jsonrpc"], r1["id"]), ("2.0", 1))
         self.assertEqual(r1["result"]["name"], "bp")
         self.assertEqual(r2["id"], 2)  # legacy envelope has no jsonrpc key
@@ -278,6 +279,17 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(r3["id"], 3)
         self.assertIsNone(r4["id"])
         self.assertEqual(r4["error"]["code"], INVALID_REQUEST)
+
+    def test_batch_ids_preserve_request_correlation(self):
+        batch, = self.srv.handle_line(json.dumps([
+            {"jsonrpc": "2.0", "id": "a", "method": "describe",
+             "params": {"command": "bp"}},
+            {"jsonrpc": "2.0", "id": "b", "method": "describe",
+             "params": {"command": "classes"}},
+        ]))
+        self.assertEqual([r["id"] for r in batch], ["a", "b"])
+        self.assertEqual([r["result"]["name"] for r in batch],
+                         ["bp", "classes"])
 
     def test_empty_batch(self):
         r, = self.srv.handle_line("[]")
@@ -561,9 +573,58 @@ class ServeStdioTests(unittest.TestCase):
         self.assertEqual(replies[0]["result"]["name"], "classes")
         self.assertIsNone(replies[1]["id"])  # parse error, not 7
         self.assertEqual(replies[1]["error"]["code"], "E_PARSE")
-        self.assertEqual(replies[2]["id"], 8)  # batch element, notif omitted
+        batch = replies[2]  # one batch -> one array line, notif omitted
+        self.assertIsInstance(batch, list)
+        el, = batch
+        self.assertEqual(el["id"], 8)
         # diagnostics stay off stdout
         self.assertIn("serving stdio", stderr.getvalue())
+
+    def test_serve_stdio_batch_is_one_array_line(self):
+        stdin = io.StringIO(json.dumps([
+            {"jsonrpc": "2.0", "id": 1, "method": "describe",
+             "params": {"command": "bp"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "describe",
+             "params": {"command": "classes"}},
+            {"jsonrpc": "2.0", "id": 3, "method": "nope"},
+        ]) + "\n")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), \
+                mock.patch.object(sys, "stdout", stdout), \
+                mock.patch.object(sys, "stderr", stderr):
+            serve_stdio(NOPE_PROJECT)
+        lines = stdout.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)  # one array line, not three objects
+        batch = strict_loads(lines[0])
+        self.assertIsInstance(batch, list)
+        self.assertEqual([r["id"] for r in batch], [1, 2, 3])
+        self.assertEqual(batch[0]["result"]["name"], "bp")
+        self.assertEqual(batch[1]["result"]["name"], "classes")
+        self.assertEqual(batch[2]["error"]["code"], METHOD_NOT_FOUND)
+
+    def test_serve_stdio_all_notification_batch_writes_nothing(self):
+        stdin = io.StringIO(json.dumps([
+            {"jsonrpc": "2.0", "method": "describe"},
+            {"jsonrpc": "2.0", "method": "capabilities"},
+        ]) + "\n")
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), \
+                mock.patch.object(sys, "stdout", stdout), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            serve_stdio(NOPE_PROJECT)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_serve_stdio_empty_batch_is_a_single_error_object(self):
+        stdin = io.StringIO("[]\n")
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdin", stdin), \
+                mock.patch.object(sys, "stdout", stdout), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            serve_stdio(NOPE_PROJECT)
+        line, = stdout.getvalue().splitlines()
+        r = strict_loads(line)
+        self.assertIsInstance(r, dict)  # not wrapped in an array
+        self.assertEqual(r["error"]["code"], INVALID_REQUEST)
 
     def test_serve_stdio_closes_session_on_eof(self):
         closed = []
