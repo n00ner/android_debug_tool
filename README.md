@@ -53,6 +53,7 @@ Key design decisions:
 
 | Table | Purpose | Key columns |
 |---|---|---|
+| `meta` | persistent APK/index facts (written by `init`) | `schema_version`, `index_version`, `index_complete`, `index_warnings`, `line_map_state`/`line_map_reason`, `manifest_debuggable`, `apk`/`sha256`/`package` |
 | `classes` | runtime class identity | `sig` (`Lcom/foo/Bar;`), `fqcn`, `deobf_fqcn`, `smali_path` |
 | `methods` | methods per class | `name`, `sig`, `is_native`, smali `line_start/line_end` |
 | `line_map` | `.line N` directives | `method_id`, `dalvik_line`, `smali_line` |
@@ -71,7 +72,7 @@ candidate text never feeds back into resolution or breakpoint targeting.
 ## Command surface
 
 Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
-`runs`, `snapshot_diff`, `aliases`, `strings`.
+`capabilities`, `runs`, `snapshot_diff`, `aliases`, `strings`.
 Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
 `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
 `snapshot`, `dump_object`, `cond`, `hook_crypto`, `watch_strings`,
