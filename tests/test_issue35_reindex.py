@@ -8,6 +8,7 @@ staging dirs) so the parsing/DB/publish stages run for real, offline.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -296,9 +297,12 @@ class FailureInjectionTests(ReindexTestBase):
 
     def test_parse_failure_keeps_prior_generation(self):
         self.init_a()
+        # per-file parse failures are tolerated (warnings); a systemic
+        # failure — every file unparsable — must abort instead of
+        # publishing an empty index over the prior generation
         with mock.patch(f"{SMALI_INDEX}.parse_smali_file",
                         side_effect=ValueError("bad smali")):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(MappingError):
                 self.init(self.apk_b)
         self.assert_prior_generation_intact()
 
@@ -320,7 +324,14 @@ class FailureInjectionTests(ReindexTestBase):
 
     def test_publish_failure_keeps_prior_generation_then_recovers(self):
         self.init_a()
-        with mock.patch("os.replace", side_effect=OSError("disk full")):
+        real_replace = os.replace
+
+        def fail_db_swap(src, dst):
+            if Path(dst) == self.proj().db_path:
+                raise OSError("disk full")
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=fail_db_swap):
             with self.assertRaises(OSError):
                 self.init(self.apk_b)
         # publish was interrupted: journal left behind, prior generation is
