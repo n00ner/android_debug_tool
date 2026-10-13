@@ -131,6 +131,63 @@ apkdbg --project ./proj serve
 {"id":10,"method":"coverage","params":{"packages":["com.target.crypto"],"mode":"line","thread":1234,"seconds":30}}
 ```
 
+## Serve-mode protocol (versions, discovery, pagination)
+
+`apkdbg serve` speaks one JSON value per line in both directions; stdout
+carries only replies, diagnostics go to stderr. Two wire versions are
+supported, selected **per request** by the presence of a `jsonrpc` member:
+
+- **`"2.0"` — JSON-RPC 2.0** ([spec](https://www.jsonrpc.org/specification)
+  is the contract). Requests must carry `"jsonrpc": "2.0"`; replies echo it.
+  Standard numeric protocol errors apply: `-32700` parse, `-32600` invalid
+  request, `-32601` method not found, `-32602` invalid params, `-32603`
+  internal. Domain errors keep their stable `E_*` code in structured
+  `error.data`: `code`/`message`/`retryable`/`outcome` are always present,
+  `hint`/`context` appear only when set. A request without `id` is a
+  **notification** (executed, never replied to). A JSON array on one line is
+  a **batch** — one reply array, notification responses omitted, an
+  all-notification batch produces no output. `params` may be an object (by
+  name) or an array (by position, in catalog order).
+- **`"1.0"` — legacy envelope (the default).** Requests without a `jsonrpc`
+  member are treated as `{"id":..,"method":..,"params":{..}}` and answered
+  with `{"id":..,"result":..}` / `{"id":..,"error":{..}}`, where the error
+  body is the same structured error data (`E_PARSE`, `E_INVALID_REQUEST`,
+  `E_METHOD_NOT_FOUND`, `E_INVALID_PARAMS`, or a domain code). Pre-#33
+  clients keep working unchanged. Requests whose version cannot be
+  determined (non-object roots) and parse failures are answered in this
+  envelope with `"id": null` — a parse error never borrows a previous id.
+
+Every request is validated against the command catalog
+(`apkdbg/core/apicatalog.py`) **before** any project/session context is
+obtained, so validation errors are deterministic and need no device.
+
+**Discovery without a project or device** (both protocol versions):
+
+```bash
+{"id":1,"method":"describe"}                          # full versioned catalog
+{"id":2,"method":"describe","params":{"command":"bp"}}# one command's schema
+{"jsonrpc":"2.0","id":3,"method":"capabilities"}      # availability states
+```
+
+`describe` returns, for every public command: `name`, `version`, `params`
+(name/type/required/default), `result` shape, `mutates`, `idempotent`,
+`retryable`, `requires` (`project`/`session`), and `pagination` where
+applicable. `capabilities` reports per-command states: `supported`,
+`unavailable_in_this_session` (needs `connect` first), or
+`unverified_runtime` (scaffolds such as `native`/lldb).
+
+**Pagination.** All list commands (`classes`, `methods`, `res`, `res_refs`,
+`bp_list`, `runs list`, `native`) accept `limit`/`offset` (limit is clamped
+to `MAX_PAGE = 500`) and return explicit truncation metadata:
+`count`, `total`, `limit`, `offset`, `truncated` — same shape as
+`runs list` from #36. Example:
+
+```bash
+{"id":4,"method":"classes","params":{"filter":"crypto","limit":10,"offset":20}}
+{"id":4,"result":{"classes":[...],"count":10,"total":37,"limit":10,"offset":20,"truncated":true}}
+```
+
+
 ## Environment
 
 - Host: Python ≥3.10, no third-party deps. Device: any debuggable APK process.
