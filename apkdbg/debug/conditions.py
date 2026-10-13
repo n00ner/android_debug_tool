@@ -120,12 +120,19 @@ class ConditionalEngine:
         self.session = session
 
     def run(self, spec: str, predicate: dict, capture: list[dict], *,
-            max_events: int = 2000, timeout_s: float = 120.0) -> dict:
+            max_events: int = 2000, timeout_s: float = 120.0,
+            collect_aliases: bool = False) -> dict:
         bp = self.session.set_breakpoint(spec, suspend_all=False)
         rids = {b["request_id"] for b in bp["breakpoints"]}
         d = self.session.events
         checked = 0
         match: dict = {}
+        collector = None
+        if collect_aliases:
+            from ..core.aliases import AliasStore
+            from .aliascollect import AliasCollector
+            collector = AliasCollector(
+                self.session, store=AliasStore.for_session(self.session))
 
         def on_event(ev: dict, lease) -> None:
             nonlocal checked
@@ -136,6 +143,15 @@ class ConditionalEngine:
             c = self.session.client
             fr = c.thread_frames(thread, 1)[0]
             captured = capture_spec(c, thread, fr["frame_id"], capture)
+            if collector is not None:
+                # already-captured values only: no extra reads here; the
+                # lease owns the suspension (issue #25)
+                collector.collect_from_record(
+                    captured,
+                    {"class_sig": ev.get("class_sig"),
+                     "method_name": (ev.get("breakpoint") or {}).get("method"),
+                     "epoch": d.epoch},
+                    client=None)
             if evaluate(predicate, captured):
                 match.update(
                     {"matched": True, "checked": checked,
@@ -159,9 +175,14 @@ class ConditionalEngine:
                 if r["events"]:
                     d.stash(r)  # not ours: preserve for wait_events
             if match:
+                if collector is not None:
+                    match["alias_collection"] = collector.report()
                 return match
-            return {"matched": False, "checked": checked,
-                    "reason": "budget" if checked >= max_events else "timeout"}
+            out = {"matched": False, "checked": checked,
+                   "reason": "budget" if checked >= max_events else "timeout"}
+            if collector is not None:
+                out["alias_collection"] = collector.report()
+            return out
         finally:
             sub.close()
             for rid in rids:

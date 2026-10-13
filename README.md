@@ -62,14 +62,20 @@ Key design decisions:
 | `resources` | from apktool `public.xml` | `res_id` (0x7f… int), `type`, `name` |
 | `resource_refs` | resource call sites in smali | `res_id`, `method_id`, `kind` (`getString`…) |
 | `coverage_hits` | persisted coverage runs | `run_id`, `class_sig`, `dalvik_line`, `hits` |
+| `alias_candidates` | reviewable runtime alias hypotheses (#25) | `class_sig`, `candidate`, `heuristic_score`, `rule`, `status`, `evidence` |
+| `alias_decisions` | full review trail per candidate | `candidate_id`, `action`, `from_status`, `to_status` |
+
+`alias_candidates`/`alias_decisions` are strictly additive: the alias
+feature never writes `classes.deobf_fqcn` or imported mappings, and
+candidate text never feeds back into resolution or breakpoint targeting.
 
 ## Command surface
 
 Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
-`capabilities`. Session (use `serve` mode for multi-step): `connect`,
-`restore`, `bp`, `bp_del`, `bp_list`, `events`, `read_var`, `write_var`,
-`invoke`, `step`, `resume`, `snapshot`, `dump_object`, `cond`,
-`hook_crypto`, `coverage`, `native`.
+`capabilities`, `runs`, `snapshot_diff`, `aliases`.
+Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
+`bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
+`snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`, `native`.
 
 ```bash
 # 1. init: decompile + build mapping DB
@@ -97,6 +103,58 @@ apkdbg --project ./proj serve
 {"id":9,"method":"coverage","params":{"packages":["com.target"],"mode":"method","seconds":60}}
 {"id":10,"method":"coverage","params":{"packages":["com.target.crypto"],"mode":"line","thread":1234,"seconds":30}}
 ```
+
+## Runtime alias candidates (review workflow, issue #25)
+
+Runtime strings (log tags, enum-like values, route/preference names) hint at
+what an obfuscated class does, but they never establish an original
+identifier. apkdbg can turn strings **already captured** by `hook_crypto`,
+`snapshot`/`dump_object`, and `cond` into *reviewable* alias candidates —
+opt in per capture with `collect_aliases=true` (implies `record`, since
+candidates link to their run/event evidence). Optional extra reads of string
+fields beyond the capture (`extra_reads` in the collector budgets) are
+separately limited by depth, object count, bytes, JDWP request count, and
+elapsed time; every collection report publishes the **measured** JDWP reads
+and added pause time — there is no zero-overhead assumption and no universal
+latency guarantee. Budget exhaustion or read failures yield partial results
+with explicit reasons; suspensions stay owned by the dispatcher lease.
+
+Heuristics are a versioned rule set (`RULES_VERSION` in
+`apkdbg/core/aliases.py`): log tags, enum-like strings, route and
+preference names produce candidates with a *heuristic score* (rule
+strength, not a calibrated probability); a generic URL is behavioral
+context only, never a name candidate. Nothing is ever auto-accepted.
+
+Review offline with `aliases` (also a serve method):
+
+```bash
+apkdbg --project ./proj aliases list --status suggested --limit 20
+apkdbg --project ./proj aliases get <candidate_id>   # evidence, source events, smali links
+apkdbg --project ./proj aliases accept <candidate_id> --note "confirmed in smali"
+apkdbg --project ./proj aliases revise <candidate_id> --alias PaymentRepository
+apkdbg --project ./proj aliases add --class-sig 'Lcom/foo/a/a;' --alias BillingRepo
+apkdbg --project ./proj aliases export --file aliases.json
+```
+
+Multiple candidates may compete per entity; accept/reject/revise are
+recorded in a full decision trail, replacements supersede reversibly, and
+a rejected (text, rule) pair stays suppressed on re-observation (counted
+and linked, never re-suggested). Repeated observations dedupe into one row
+keeping frequency (`observations`, first/last seen) and per-run/event
+evidence refs. Observations from distinct classloaders of the same class
+signature stay separate rows; runtime classes absent from the static index
+keep evidence without a fabricated static match (`static_match: false`).
+
+Accepted aliases surface as a distinct `alias` field next to `sig` and
+`deobf` in translate resolution, breakpoint, snapshot, classes, and
+coverage responses — the original machine identity is preserved everywhere
+and aliases never affect method resolution or breakpoint targeting.
+
+**Retention:** candidates, decisions, and evidence live in the project
+`mapping.db`, are carried across re-indexing like the other observation
+tables, and are deleted only with the project. Candidate text and evidence
+may contain application data (captured strings) — treat `aliases export`
+output as sensitive.
 
 ## Serve-mode protocol (versions, discovery, pagination)
 
@@ -144,7 +202,8 @@ applicable. `capabilities` reports per-command states: `supported`,
 `unverified_runtime` (scaffolds such as `native`/lldb).
 
 **Pagination.** All list commands (`classes`, `methods`, `res`, `res_refs`,
-`bp_list`, `runs list`, `native`) accept `limit`/`offset` (limit is clamped
+`bp_list`, `runs list`, `aliases list`, `native`) accept `limit`/`offset`
+(limit is clamped
 to `MAX_PAGE = 500`) and return explicit truncation metadata:
 `count`, `total`, `limit`, `offset`, `truncated` — same shape as
 `runs list` from #36. Example:

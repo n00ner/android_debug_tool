@@ -123,6 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="persist as an artifact under a run manifest")
     sp.add_argument("--run-id", help="attach to an existing run")
     sp.add_argument("--scenario")
+    sp.add_argument("--collect-aliases", action="store_true",
+                    help="feed captured strings to the alias collector "
+                         "(implies --record for evidence)")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("dump_object")
@@ -132,6 +135,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="persist as an artifact under a run manifest")
     sp.add_argument("--run-id", help="attach to an existing run")
     sp.add_argument("--scenario")
+    sp.add_argument("--collect-aliases", action="store_true",
+                    help="feed captured strings to the alias collector "
+                         "(implies --record for evidence)")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("cond", help="conditional breakpoint")
@@ -140,6 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--capture", required=True, help="JSON capture spec")
     sp.add_argument("--max-events", type=int, default=2000)
     sp.add_argument("--timeout", type=float, default=120.0)
+    sp.add_argument("--collect-aliases", action="store_true",
+                    help="feed captured strings to the alias collector")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("hook_crypto", help="watch javax.crypto for N seconds")
@@ -155,6 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="persist the watch as a run manifest with one "
                          "event row per captured record")
     sp.add_argument("--scenario")
+    sp.add_argument("--collect-aliases", action="store_true",
+                    help="feed captured strings to the alias collector "
+                         "(implies --record for evidence)")
     sp.add_argument("--pkg")
 
     sp = sub.add_parser("coverage", help="branch/method coverage")
@@ -185,6 +196,30 @@ def build_parser() -> argparse.ArgumentParser:
                          "are kept in the output)")
 
     sub.add_parser("native", help="list native methods + lldb plan")
+
+    sp = sub.add_parser("aliases", help="review runtime alias candidates "
+                                        "(issue #25)")
+    sp.add_argument("action",
+                    choices=["list", "get", "accept", "reject", "revise",
+                             "add", "export"])
+    sp.add_argument("candidate_id", nargs="?")
+    sp.add_argument("--class-sig", help="original runtime descriptor, "
+                                        "e.g. Lcom/foo/Bar;")
+    sp.add_argument("--alias", help="alias text (add: new alias; revise: "
+                                    "replacement text)")
+    sp.add_argument("--method", help="method-scoped alias: method name")
+    sp.add_argument("--method-sig", help="method-scoped alias: descriptor")
+    sp.add_argument("--status",
+                    choices=["suggested", "accepted", "rejected",
+                             "superseded"])
+    sp.add_argument("--filter", help="substring match on candidate/class")
+    sp.add_argument("--note")
+    sp.add_argument("--file", help="export destination path")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+    sp.add_argument("--all-apks", action="store_true",
+                    help="list candidates of every indexed APK, not just "
+                         "the current one")
 
     sub.add_parser("serve", help="JSON-RPC over stdio (for LLM agents)")
     return p
