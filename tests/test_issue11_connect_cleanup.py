@@ -10,9 +10,9 @@ peer's recv() blocked.
 from __future__ import annotations
 
 import socket
-import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from apkdbg.device.jdwp import HANDSHAKE, JdwpClient, JdwpConnError
 
@@ -38,14 +38,30 @@ class _Listener:
 
 def _assert_peer_sees_eof(test: unittest.TestCase, peer: socket.socket):
     """Drain until EOF; if the client socket is still open this blocks
-    (peer timeout turns it into a test failure, not a hang)."""
+    (peer timeout turns it into a test failure, not a hang). A reset
+    (close with unread reply data pending, e.g. the rejected-handshake
+    case) proves closure just as a clean EOF does."""
     data = b""
     while True:
-        chunk = peer.recv(4096)
+        try:
+            chunk = peer.recv(4096)
+        except ConnectionResetError:
+            return
         if not chunk:
             return
         data += chunk
         test.assertLess(len(data), 1 << 20)
+
+
+def run_peer(serve, action, timeout=10):
+    """Run the fake peer on an executor while `action` drives the client;
+    peer failures (assertions, socket timeouts) re-raise on the test
+    thread via result() — a bare Thread would swallow them into
+    threading.excepthook and t.join() would not re-raise."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        peer = pool.submit(serve)
+        action()
+        peer.result(timeout=timeout)
 
 
 class FailedConnectCleanupTest(unittest.TestCase):
@@ -74,11 +90,11 @@ class FailedConnectCleanupTest(unittest.TestCase):
                 self.assertEqual(got, HANDSHAKE)
                 _assert_peer_sees_eof(self, peer)
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpConnError):
-            self.client.connect()
-        t.join(timeout=10)
+        def attempt():
+            with self.assertRaises(JdwpConnError):
+                self.client.connect()
+
+        run_peer(serve, attempt)
         self._assert_clean()
 
     def test_issue11_rejected_handshake(self):
@@ -88,11 +104,11 @@ class FailedConnectCleanupTest(unittest.TestCase):
                 peer.sendall(b"NOT-A-JDWP-PEER")  # wrong 14-byte reply
                 _assert_peer_sees_eof(self, peer)
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpConnError):
-            self.client.connect()
-        t.join(timeout=10)
+        def attempt():
+            with self.assertRaises(JdwpConnError):
+                self.client.connect()
+
+        run_peer(serve, attempt)
         self._assert_clean()
 
     def test_issue11_eof_during_handshake(self):
@@ -100,11 +116,11 @@ class FailedConnectCleanupTest(unittest.TestCase):
             with self.listener.accept() as peer:
                 peer.recv(len(HANDSHAKE))  # then close without replying
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpConnError):
-            self.client.connect()
-        t.join(timeout=10)
+        def attempt():
+            with self.assertRaises(JdwpConnError):
+                self.client.connect()
+
+        run_peer(serve, attempt)
         self._assert_clean()
 
     def test_issue11_timeout_during_init_requests(self):
@@ -116,11 +132,11 @@ class FailedConnectCleanupTest(unittest.TestCase):
                 peer.sendall(HANDSHAKE)
                 _assert_peer_sees_eof(self, peer)
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpConnError):
-            self.client.connect()
-        t.join(timeout=10)
+        def attempt():
+            with self.assertRaises(JdwpConnError):
+                self.client.connect()
+
+        run_peer(serve, attempt)
         self._assert_clean()
 
     def test_issue11_context_manager_entry_failure(self):
@@ -131,13 +147,23 @@ class FailedConnectCleanupTest(unittest.TestCase):
                 peer.recv(len(HANDSHAKE))
                 _assert_peer_sees_eof(self, peer)
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpConnError):
-            with self.client:
-                pass
-        t.join(timeout=10)
+        def attempt():
+            with self.assertRaises(JdwpConnError):
+                with self.client:
+                    pass
+
+        run_peer(serve, attempt)
         self._assert_clean()
+
+    def test_peer_failure_reaches_the_test_result(self):
+        """Pattern guard: a peer thread that raises must fail the test —
+        with a bare Thread this AssertionError only reached
+        threading.excepthook and the suite stayed green."""
+        def serve():
+            raise AssertionError("injected peer failure")
+
+        with self.assertRaises(AssertionError):
+            run_peer(serve, lambda: None)
 
 
 if __name__ == "__main__":

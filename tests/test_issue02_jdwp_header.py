@@ -16,6 +16,7 @@ import struct
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from apkdbg.device.jdwp import (
     CS_EVENT, CS_VM, EV_COMPOSITE, HANDSHAKE, JdwpClient, JdwpConnError,
@@ -81,13 +82,14 @@ class ConnectFramingTest(unittest.TestCase):
         unequal negotiated ID sizes landing on the right fields."""
         client = JdwpClient("127.0.0.1", 0, timeout=2)
         client.sock, peer = socket.socketpair()
-        t = threading.Thread(target=_serve_handshake_and_init, args=(peer,),
-                             daemon=True)
-        t.start()
-        # hand connect() a pre-connected socketpair end instead of TCP
-        with _patched_create_connection(client.sock):
-            client.connect()
-        t.join(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # peer assertions/timeouts re-raise via result() — a bare
+            # Thread would swallow them into threading.excepthook
+            serving = pool.submit(_serve_handshake_and_init, peer)
+            # hand connect() a pre-connected socketpair end instead of TCP
+            with _patched_create_connection(client.sock):
+                client.connect()
+            serving.result(timeout=5)
         peer.close()
         self.assertEqual((client.sizes.field, client.sizes.method,
                           client.sizes.object, client.sizes.reftype,
@@ -101,12 +103,12 @@ class ConnectFramingTest(unittest.TestCase):
         """Replies dribbled one byte at a time must still assemble."""
         client = JdwpClient("127.0.0.1", 0, timeout=5)
         client.sock, peer = socket.socketpair()
-        t = threading.Thread(target=_serve_handshake_and_init,
-                             args=(peer, ID_SIZES, 1), daemon=True)
-        t.start()
-        with _patched_create_connection(client.sock):
-            client.connect()
-        t.join(timeout=10)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            serving = pool.submit(_serve_handshake_and_init,
+                                  peer, ID_SIZES, 1)
+            with _patched_create_connection(client.sock):
+                client.connect()
+            serving.result(timeout=10)
         peer.close()
         self.assertEqual(client.sizes.field, ID_SIZES[0])
         client.close()
@@ -142,10 +144,10 @@ class ReplyFramingTest(_PeerCase):
             recv_exact(self.peer, length - 11)
             self.peer.sendall(reply_packet(pid, 0, b""))
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        r = self.client.request(CS_VM, VM_SUSPEND)
-        t.join(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            serving = pool.submit(serve)
+            r = self.client.request(CS_VM, VM_SUSPEND)
+            serving.result(timeout=5)
         self.assertEqual(len(r.b), 0)
 
     def test_issue2_error_reply_bytes_come_from_header(self):
@@ -161,11 +163,11 @@ class ReplyFramingTest(_PeerCase):
             # THREAD_NOT_SUSPENDED = 13, in the HEADER where it belongs
             self.peer.sendall(reply_packet(pid, 13, payload))
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpReplyError) as ctx:
-            self.client.request(CS_VM, VM_SUSPEND)
-        t.join(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            serving = pool.submit(serve)
+            with self.assertRaises(JdwpReplyError) as ctx:
+                self.client.request(CS_VM, VM_SUSPEND)
+            serving.result(timeout=5)
         self.assertEqual(ctx.exception.context["error_no"], 13)
         self.assertIn("THREAD_NOT_SUSPENDED", str(ctx.exception))
 
@@ -183,10 +185,10 @@ class ReplyFramingTest(_PeerCase):
             self.peer.sendall(command_packet(99, CS_EVENT, EV_COMPOSITE,
                                              payload))
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        got = self.client.next_event(timeout=5)
-        t.join(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            serving = pool.submit(serve)
+            got = self.client.next_event(timeout=5)
+            serving.result(timeout=5)
         self.assertEqual(got["suspend_policy"], 2)
         (e,) = got["events"]
         self.assertEqual((e["kind"], e["kind_id"], e["request_id"]),
@@ -210,11 +212,11 @@ class BrokenStreamTest(_PeerCase):
                               + b"abc")
             self.peer.close()  # EOF mid-packet
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        with self.assertRaises(JdwpConnError):
-            self.client.request(CS_VM, VM_SUSPEND)
-        t.join(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            serving = pool.submit(serve)
+            with self.assertRaises(JdwpConnError):
+                self.client.request(CS_VM, VM_SUSPEND)
+            serving.result(timeout=5)
         self.reader.join(timeout=5)
         self.assertIsNotNone(self.client._dead)
         self.assertFalse(self.client._alive)
@@ -228,10 +230,10 @@ class BrokenStreamTest(_PeerCase):
             self.peer.sendall(struct.pack(">IIBBB", 4, 1, 0,
                                           CS_EVENT, EV_COMPOSITE))
 
-        t = threading.Thread(target=serve, daemon=True)
-        t.start()
-        self.reader.join(timeout=5)
-        t.join(timeout=5)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            serving = pool.submit(serve)
+            self.reader.join(timeout=5)
+            serving.result(timeout=5)
         self.assertFalse(self.reader.is_alive(),
                          "reader hung on malformed length")
         self.assertIsNotNone(self.client._dead)
