@@ -359,6 +359,47 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--event-id", help="parent event for the artifact")
     sp.add_argument("--pkg")
 
+    sp = sub.add_parser("unpack",
+                        help="discover/validate runtime DEX payloads at "
+                             "loading boundaries (issue #28, experimental)")
+    sp.add_argument("--duration", type=float, default=60.0)
+    sp.add_argument("--boundaries",
+                    help="comma-separated: in_memory_dex_class_loader "
+                         "(default) | dex_class_loader_path | hook names")
+    sp.add_argument("--cipher-overloads",
+                    help="comma-separated Cipher.doFinal overloads to "
+                         "observe (opt-in), e.g. 'Cipher.doFinal(byte[])'")
+    sp.add_argument("--defer", action="store_true",
+                    help="CLASS_PREPARE-watch pending boundaries and "
+                         "auto-install when their class loads")
+    sp.add_argument("--max-events", type=int, default=200)
+    sp.add_argument("--max-candidates", type=int, default=25)
+    sp.add_argument("--max-candidate-bytes", type=int, default=16 << 20)
+    sp.add_argument("--max-run-bytes", type=int, default=64 << 20)
+    sp.add_argument("--prefix-bytes", type=int, default=4096)
+    sp.add_argument("--export-dir",
+                    help="artifact destination (default: "
+                         "<project>/exports)")
+    sp.add_argument("--record", action="store_true",
+                    help="persist the watch as a run manifest with one "
+                         "event row per observation")
+    sp.add_argument("--scenario")
+    sp.add_argument("--index", action="store_true",
+                    help="register each validated artifact into the "
+                         "project's runtime_artifacts table (additive; "
+                         "never replaces the APK index)")
+    sp.add_argument("--pkg")
+
+    sp = sub.add_parser("unpack_index",
+                        help="register validated runtime DEX artifacts "
+                             "into the project DB (issue #28)")
+    sp.add_argument("action", choices=["list", "index"])
+    sp.add_argument("artifact_id", nargs="?",
+                    help="unpack_dex artifact id from a recorded unpack "
+                         "run (action=index)")
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+
     sp = sub.add_parser("aliases", help="review runtime alias candidates "
                                         "(issue #25)")
     sp.add_argument("action",
@@ -419,7 +460,7 @@ SESSION_VERBS = {"bp", "bp_del", "bp_list", "events", "read_var", "write_var",
                  "invoke", "step", "resume", "restore", "snapshot",
                  "dump_object", "cond", "hook_crypto", "watch_strings",
                  "watch_framework", "coverage", "native", "export_buffer",
-                 "job_start"}
+                 "unpack", "job_start"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -464,8 +505,12 @@ def _kwargs(args: argparse.Namespace) -> dict:
             k, v = "dedupe", not v
         if k == "hooks" and isinstance(v, str):
             v = [x.strip() for x in v.split(",") if x.strip()]
-        if k in ("families", "exclude") and isinstance(v, str):
+        if k in ("families", "exclude", "boundaries") \
+                and isinstance(v, str):
             v = [x.strip() for x in v.split(",") if x.strip()]
+        if k == "cipher_overloads" and isinstance(v, str):
+            # overload names contain commas ("Cipher.doFinal(byte[],int,int)")
+            v = [x.strip() for x in v.split(";") if x.strip()]
         if k == "packages" and isinstance(v, str):
             v = [x.strip() for x in v.split(",") if x.strip()]
         kw[k] = v

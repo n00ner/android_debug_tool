@@ -75,6 +75,8 @@ _COMPLETIONS = {
     "budget": ("completed", "event_budget", True),
     "max_bytes": ("completed", "output_budget", True),
     "max_output_bytes": ("completed", "output_budget", True),
+    "max_run_bytes": ("completed", "output_budget", True),
+    "max_candidates": ("completed", "event_budget", True),
     "cancelled": ("cancelled", "cancellation", True),
     "error": ("failed", "capture_failure", True),
 }

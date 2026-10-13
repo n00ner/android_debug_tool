@@ -31,6 +31,8 @@ public class RunReceiver extends BroadcastReceiver {
             "com.apkdbg.cryptofixture.FW_BENCH";
     public static final String ACTION_BUFFERS =
             "com.apkdbg.cryptofixture.BUFFERS";
+    public static final String ACTION_UNPACK =
+            "com.apkdbg.cryptofixture.UNPACK";
     private static final String TAG = "CryptoFixture";
 
     static final byte[] AES_KEY = hex("2b7e151628aed2a6abf7158809cf4f3c");
@@ -73,6 +75,12 @@ public class RunReceiver extends BroadcastReceiver {
         }
         if (ACTION_BUFFERS.equals(intent.getAction())) {
             BufferWork.build();    // buffer export fixture corpus (#38)
+            return;
+        }
+        if (ACTION_UNPACK.equals(intent.getAction())) {
+            // runtime DEX payload fixture (#28): decrypts the embedded
+            // payload DEX and loads it through the supported boundaries
+            UnpackWork.run(ctx.getApplicationContext());
             return;
         }
         if (!ACTION_RUN.equals(intent.getAction())) {
