@@ -60,6 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--launch", action="store_true")
     sp.add_argument("--activity")
     sp.add_argument("--timeout", type=int, default=30)
+    sp.add_argument("--recovery", choices=["kill-server"], default=None,
+                    help="explicitly allow a global adb server restart as "
+                         "last-resort recovery (default: session-scoped "
+                         "only — never touches other sessions' forwards)")
+
+    sp = sub.add_parser("restore", help="re-install symbolic "
+                                        "breakpoints/hooks after a reconnect")
+    sp.add_argument("--pkg")
 
     sp = sub.add_parser("bp", help="set breakpoint: com.foo.Class.method:42")
     sp.add_argument("spec")
@@ -184,8 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 # verbs that need a live JDWP session; CLI auto-connects when --pkg is given
 SESSION_VERBS = {"bp", "bp_del", "bp_list", "events", "read_var", "write_var",
-                 "invoke", "step", "resume", "snapshot", "dump_object",
-                 "cond", "hook_crypto", "coverage", "native"}
+                 "invoke", "step", "resume", "restore", "snapshot",
+                 "dump_object", "cond", "hook_crypto", "coverage", "native"}
 
 
 def main(argv: list[str] | None = None) -> int:

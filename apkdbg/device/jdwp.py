@@ -60,6 +60,19 @@ EVK_CLASS_PREPARE = 8
 EVK_METHOD_ENTRY, EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET = 40, 41, 42
 EVK_VM_INIT, EVK_VM_DEATH = 90, 99
 
+# commands with VM-side effects (issue #32): once one of these has been
+# dispatched, the public operation it belongs to is no longer provably
+# unexecuted — a later packet failing pre-dispatch must not trigger a
+# replay. EventRequest set/clear are excluded on purpose: they die with
+# the connection, so their replay can never duplicate an effect.
+STATE_COMMANDS = frozenset({
+    (CS_VM, VM_RESUME), (CS_VM, VM_CREATE_STRING),
+    (CS_THREADREF, TR_RESUME),
+    (CS_STACKFRAME, SF_SETVALUES),
+    (CS_OBJECTREF, OR_SETVALUES), (CS_OBJECTREF, OR_INVOKE),
+    (CS_CLASSTYPE, CT_INVOKE), (CS_CLASSTYPE, 4),  # ClassType.NewInstance
+})
+
 EVENT_KIND_NAMES = {
     1: "single_step", 2: "breakpoint", 4: "exception", 6: "thread_start",
     7: "thread_death", 8: "class_prepare", 40: "method_entry",
@@ -98,6 +111,19 @@ SIG_TO_TAG = {"B": 66, "Z": 90, "C": 67, "S": 83, "F": 70, "D": 68,
 
 
 class JdwpConnError(JdwpError):
+    """Transport-level failure. `context["phase"]` (set by request()) says
+    where the fault struck, which the session's recovery policy branches on
+    (issue #32):
+      pre-dispatch — dead connection detected before send: the command was
+                     provably never transmitted; replaying cannot duplicate
+                     a VM-side effect;
+      transmit     — sendall failed: a partial packet may have reached the
+                     VM; a state-changing command may have executed;
+      post-send    — the command was fully sent but the reply never arrived
+                     (timeout or connection drop while waiting): the VM may
+                     have executed it. Uncertain for mutations.
+    Untagged errors (handshake, reader loop, next_event) carry no phase and
+    must be treated conservatively as post-send."""
     code = "E_JDWP_CONN"
 
 
@@ -243,6 +269,7 @@ class JdwpClient:
         self._events: queue.Queue = queue.Queue()
         self._alive = False
         self._dead: Exception | None = None
+        self._state_dispatched = 0  # STATE_COMMANDS fully transmitted
         self._reader_t: threading.Thread | None = None
         self.handshake_info: dict = {}
         # Resolution caches for the checked invoke paths (issues #22, #23).
@@ -380,7 +407,8 @@ class JdwpClient:
     def request(self, cmdset: int, cmd: int, payload: bytes = b"",
                 timeout: float | None = None) -> Reader:
         if self._dead:
-            raise JdwpConnError(f"JDWP connection is dead: {self._dead}")
+            raise JdwpConnError(f"JDWP connection is dead: {self._dead}",
+                                phase="pre-dispatch")
         pid = self._alloc_id()
         slot = {"event": threading.Event(), "error": None, "data": b""}
         with self._send_lock:
@@ -390,15 +418,29 @@ class JdwpClient:
                 self.sock.sendall(pkt + payload)
             except OSError as e:
                 self._pending.pop(pid, None)
-                raise JdwpConnError(f"JDWP send failed: {e}") from e
+                raise JdwpConnError(f"JDWP send failed: {e}",
+                                    phase="transmit") from e
+            if (cmdset, cmd) in STATE_COMMANDS:
+                self._state_dispatched += 1
         if not slot["event"].wait(timeout or self.timeout):
             self._pending.pop(pid, None)
-            raise JdwpConnError(f"JDWP reply timeout cmdset={cmdset} cmd={cmd}")
+            raise JdwpConnError(
+                f"JDWP reply timeout cmdset={cmdset} cmd={cmd}",
+                phase="post-send")
         if slot["error"] == -1:
-            raise JdwpConnError(f"JDWP connection lost: {self._dead}")
+            raise JdwpConnError(f"JDWP connection lost: {self._dead}",
+                                phase="post-send")
         if slot["error"]:
             raise JdwpReplyError(slot["error"], cmdset, cmd)
         return Reader(slot["data"], self.sizes)
+
+    @property
+    def state_dispatched(self) -> int:
+        """How many state-changing commands (STATE_COMMANDS) have been
+        fully transmitted on this connection. An op's replay key: a fault
+        after this counter moved means the mutation may already be
+        applied, whatever the failing packet's own phase says."""
+        return self._state_dispatched
 
     # -- VM introspection ------------------------------------------------------
     def classes_by_signature(self, sig: str) -> list[dict]:

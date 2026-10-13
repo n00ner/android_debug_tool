@@ -66,43 +66,10 @@ Key design decisions:
 ## Command surface
 
 Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
-`capabilities`. Session (use `serve` mode for multi-step): `connect`, `bp`,
-`bp_del`, `bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`,
-`resume`, `snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`,
-`native`.
-
-## Capability matrix (`capabilities`)
-
-`capabilities` reports — **offline, no device needed, never attaches by
-default** — what this project/APK can actually do, per capability:
-`{"status": supported|limited|unsupported|unknown, "evidence": {...},
-"source": ..., "hint": ...}`. A summary `mode` is included but the
-per-capability records are authoritative.
-
-| Capability | Status basis (offline) |
-|---|---|
-| `classes`, `methods`, `res`, `res_refs` | `supported` with row counts as evidence; `unknown` when the index is incomplete |
-| `source_line_resolution` | `supported` when the line map has rows; `unsupported` (`no_line_directives`, likely stripped) when a *completed* index has zero rows; `unknown` (`index_incomplete` / `no_index_metadata`) when an empty map proves nothing |
-| `jdwp_attach` | `unknown`/`limited` from the **manifest** `android:debuggable` fact (true/false/unknown — never conflated with the device's `ro.debuggable`, never treated as proof) |
-| `runtime_line_table`, `connect`, `bp`, and all other runtime commands | `unknown` pre-probe (`static_inference`), each reported individually |
-
-Persistent facts are recorded by `init` in `mapping.db`'s `meta` table
-(`schema_version`, `index_version`, counts, `index_complete`,
-`index_warnings`, `line_map_state`/`line_map_reason`, `manifest_debuggable`).
-Zero line-map rows are **not** treated as proof of stripped debug info: an
-index-generation failure records `index_incomplete` instead.
-
-`capabilities --probe` adds **explicit, transient** live observations (never
-persisted over the static facts): device presence → process presence → JDWP
-attach state → observed runtime `Method.LineTable` availability
-(present/absent/unknown). Observed entries flip `source` to `observed`.
-
-Structured runtime error codes (single-line JSON, machine-readable `code` +
-`hint`): `E_DEVICE_ABSENT` (no adb device), `E_PROCESS_ABSENT` (target not
-running), `E_ATTACH_UNAVAILABLE` (JDWP refused after recovery ladder, e.g.
-non-debuggable app), `E_LINE_MAPPING` (`bp` on an empty/incomplete line map —
-hint points at smali/method-entry coordinates), `E_UNSUPPORTED` (feature not
-supported for this APK/device).
+`capabilities`. Session (use `serve` mode for multi-step): `connect`,
+`restore`, `bp`, `bp_del`, `bp_list`, `events`, `read_var`, `write_var`,
+`invoke`, `step`, `resume`, `snapshot`, `dump_object`, `cond`,
+`hook_crypto`, `coverage`, `native`.
 
 ```bash
 # 1. init: decompile + build mapping DB
@@ -208,11 +175,25 @@ export APKDBG_ADB="C:\Users\<you>\AppData\Local\Android\Sdk\platform-tools\adb.e
 "$APKDBG_ADB" kill-server && "$APKDBG_ADB" start-server
 ```
 
-**adb in a bad state mid-session.** apkdbg's connect path already walks a
-recovery ladder (`get-state` probe → `reconnect` → `kill-server`/`start-server`
-→ relaunch), but if you run adb by hand: `adb kill-server`, replug or
-`adb reconnect`, verify with `adb devices -l` and `adb shell pidof <pkg>`
-before retrying.
+**adb in a bad state mid-session.** apkdbg keeps recovery scoped to the
+affected session: a dropped JDWP transport rebuilds only that session's
+own forward listener and (at most) runs `adb reconnect` for the selected
+device — other sessions' forwards and the global adb server are never
+touched. A global server restart happens only when explicitly requested
+(`connect` with `recovery="kill-server"`). If you run adb by hand:
+`adb kill-server`, replug or `adb reconnect`, verify with
+`adb devices -l` and `adb shell pidof <pkg>` before retrying.
+
+**Connection dropped mid-operation.** State-changing ops (invoke,
+write_var, resume, step) are never transparently replayed: if the request
+may have reached the VM before the drop, the caller gets a structured
+`E_OUTCOME_UNKNOWN` error (execution is *unknown*, not failed) carrying
+the op name, connection epoch, and recovery state. Read-only ops retry
+once after the scoped reconnect, except ops taking numeric thread/frame
+ids — those fail with an actionable `E_STALE_HANDLE` error instead of
+reading a reused id. Breakpoint/hook definitions survive as symbolic
+defs: run `restore` after a reconnect (or a process restart + `connect`)
+to re-install them and get the NEW request ids.
 
 **ART JDWP quirks (handled internally, listed for reference):**
 

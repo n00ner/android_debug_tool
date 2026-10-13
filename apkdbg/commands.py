@@ -183,10 +183,22 @@ def cmd_capabilities(ctx: Ctx, probe: bool = False) -> dict:
 
 # ------------------------------------------------------------------- session
 def cmd_connect(ctx: Ctx, pkg: str | None = None, launch: bool = False,
-                activity: str | None = None, timeout: int = 30) -> dict:
+                activity: str | None = None, timeout: int = 30,
+                recovery: str | None = None) -> dict:
+    """recovery: omit for session-scoped recovery only; "kill-server"
+    explicitly allows a global adb server restart as a last resort
+    (affects every attached device/session — never a silent fallback)."""
     ctx.connect_session(pkg, launch=launch, activity=activity,
-                        timeout=timeout)
+                        timeout=timeout, recovery=recovery)
     return ctx._info
+
+
+def cmd_restore(ctx: Ctx, defer: bool = True) -> dict:
+    """Re-install symbolic breakpoint/hook definitions on the current
+    connection (issue #32). Use after a reconnect or a process restart +
+    connect; reports per-item installed (NEW request ids) / pending /
+    failed — ids from a previous epoch are never revived."""
+    return ctx.session.restore_requests(defer=defer)
 
 
 def cmd_bp(ctx: Ctx, spec: str) -> dict:
@@ -372,6 +384,7 @@ COMMANDS = {
     "res_refs": cmd_res_refs,
     "capabilities": cmd_capabilities,
     "connect": cmd_connect,
+    "restore": cmd_restore,
     "bp": cmd_bp,
     "bp_del": cmd_bp_del,
     "bp_list": cmd_bp_list,

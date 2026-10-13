@@ -122,6 +122,62 @@ class SessionError(ApkDbgError):
     code = "E_SESSION"
 
 
+# -------------------------------------------------- recovery (issue #32)
+class OutcomeUnknownError(JdwpError):
+    """A state-changing request was (fully or partially) transmitted before
+    the connection dropped: the VM may already have executed it. Execution
+    is UNKNOWN — not failed — so the op is never transparently replayed.
+    Context carries op, phase (transmit/post-send), epoch/epoch_new, and
+    the recovery state of the session."""
+    code = "E_OUTCOME_UNKNOWN"
+    retryable = False          # blind retry could execute app code twice
+    outcome = "unknown"
+
+    def __init__(self, op: str, *, phase: str, epoch: int,
+                 epoch_new: int | None, recovery: str,
+                 hint: str | None = None):
+        when = {"transmit": "during transmission of the request",
+                "post-send": "after the request reached the VM but before "
+                             "its reply arrived"}.get(phase, phase)
+        super().__init__(
+            f"{op}: connection lost {when}; whether the VM executed it is "
+            "UNKNOWN (this is not a failure confirmation)",
+            hint=hint or "verify target state out-of-band (fresh events, a "
+                         "read of the mutated state) before deciding to "
+                         "re-issue the operation by hand",
+            op=op, phase=phase, epoch=epoch, epoch_new=epoch_new,
+            recovery=recovery)
+
+
+class ProcessDiedError(SessionError):
+    """The target process restarted (pid change) or exited — distinct from
+    a recoverable transport failure. Every handle, request, and frame is
+    gone; recovery requires a full re-attach plus symbolic restore."""
+    code = "E_PROCESS_DIED"
+
+    def __init__(self, message: str, **context):
+        super().__init__(message,
+                         hint="re-run connect, then 'restore' to re-install "
+                              "breakpoints/hooks from their symbolic "
+                              "definitions", **context)
+
+
+class StaleHandleError(SessionError):
+    """A numeric handle (thread/frame/object/type id) was used after the
+    connection epoch that issued it died. The new connection may reuse the
+    same numeric id for an unrelated object, so the op is refused instead
+    of silently reading the wrong target."""
+    code = "E_STALE_HANDLE"
+
+    def __init__(self, op: str, *, epoch: int, hint: str | None = None):
+        super().__init__(
+            f"{op}: thread/frame/object ids are per-connection and died "
+            f"with connection epoch {epoch}",
+            hint=hint or "re-acquire fresh ids from new events/frames "
+                         "(wait_events, step), then retry the operation",
+            op=op, epoch=epoch)
+
+
 class ResolveError(ApkDbgError):
     code = "E_RESOLVE"
 
