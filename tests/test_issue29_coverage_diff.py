@@ -256,6 +256,38 @@ class AABaselineTests(unittest.TestCase):
         out = coverage_diff(self.proj, "noisyA", "noisyB")
         self.assertEqual(entries(out, "hit_count"), [])
 
+    def test_zero_observation_runs_count_in_hit_spread(self):
+        # rates [0.1, 0] vs [0.2, 0]: the runs that did not observe the
+        # key are 0.0 samples, so spreads are 0.1 and 0.2 and the mean
+        # difference (0.05) is suppressed as repeat noise — without them
+        # both spreads read 0 and the change ranked at 0.5
+        rid = make_run(self.store, "zeroA", events=100)
+        seed_hits(self.proj, rid, [(CLS, "m", "()V", 10, 10)])
+        make_run(self.store, "zeroA", events=100)   # no row for the key
+        rid = make_run(self.store, "zeroB", events=100)
+        seed_hits(self.proj, rid, [(CLS, "m", "()V", 10, 20)])
+        make_run(self.store, "zeroB", events=100)   # no row for the key
+        out = coverage_diff(self.proj, "zeroA", "zeroB")
+        self.assertEqual(out["ranked"], [])
+
+    def test_zero_samples_still_allow_real_differences(self):
+        # [0.1, 0] vs [1.0, 1.0]: the difference (0.9) exceeds the padded
+        # spreads (0.1, 0) and ranks; the reported distributions include
+        # the zero-observation runs
+        rid = make_run(self.store, "partA", events=100)
+        seed_hits(self.proj, rid, [(CLS, "m", "()V", 10, 10)])
+        make_run(self.store, "partA", events=100)
+        for _ in range(2):
+            rid = make_run(self.store, "partB", events=100)
+            seed_hits(self.proj, rid, [(CLS, "m", "()V", 10, 100)])
+        out = coverage_diff(self.proj, "partA", "partB")
+        hit = entries(out, "hit_count")
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["score_explanation"]["baseline_spread"],
+                         0.1)
+        self.assertEqual(hit[0]["normalized"],
+                         {"baseline": [0.1, 0.0], "candidate": [1.0, 1.0]})
+
     def test_single_run_label_cannot_split(self):
         self._identical_runs("solo", 1)
         with self.assertRaises(SessionError):
