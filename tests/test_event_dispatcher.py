@@ -311,6 +311,39 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual(c.resumed, [])
         self.assertTrue(r.lease.released)
 
+    def test_unclaimed_stop_on_same_thread_retains_suspension(self):
+        c = FakeClient()
+        c.sigs[1000] = "Lcom/foo/A;"
+        s = make_session(c)
+        d = s.events
+        d.register(1, {"owner": "crypto", "kind": EVK_BREAKPOINT})
+        d.register(3, {"owner": "user", "kind": EVK_BREAKPOINT})
+        got = []
+        d.subscribe("crypto", lambda ev, lease: got.append(ev))
+        # watcher and user breakpoint both fire on thread 11 in one composite
+        r = d.dispatch(composite(bp_event(1, thread=11),
+                                 bp_event(3, thread=11)))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(c.resumed, [])  # user stop keeps thread 11 suspended
+        self.assertEqual([e["request_id"] for e in r["events"]], [3])
+        self.assertTrue(r.lease.released)
+
+    def test_claimed_only_thread_resumed_alongside_shared_thread(self):
+        c = FakeClient()
+        c.sigs[1000] = "Lcom/foo/A;"
+        s = make_session(c)
+        d = s.events
+        d.register(1, {"owner": "crypto", "kind": EVK_BREAKPOINT})
+        d.register(3, {"owner": "user", "kind": EVK_BREAKPOINT})
+        got = []
+        d.subscribe("crypto", lambda ev, lease: got.append(ev))
+        r = d.dispatch(composite(bp_event(1, thread=11),
+                                 bp_event(1, thread=12),
+                                 bp_event(3, thread=11)))
+        self.assertEqual(len(got), 2)
+        self.assertEqual(c.resumed, [12])  # exclusively claimed thread only
+        self.assertEqual([e["request_id"] for e in r["events"]], [3])
+
 
 class DeferredInstallTests(unittest.TestCase):
     def _prepare(self, c, *type_ids):

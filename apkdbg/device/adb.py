@@ -8,7 +8,7 @@ import re
 import shlex
 import time
 
-from ..errors import AdbError
+from ..errors import AdbError, DeviceAbsentError, ProcessNotFoundError
 from ..util import find_binary, run
 
 
@@ -42,10 +42,14 @@ class Adb:
     # -- device state -------------------------------------------------------
     def ensure_device(self) -> str:
         state = self.sh("get-state", check=False)
-        if state != "device":
-            raise AdbError(f"device not ready (state={state or 'none'})",
-                           hint="check USB cable / adb authorization")
-        return state
+        if state == "device":
+            return state
+        if not state:  # adb prints "error: no devices/emulators found" on stderr
+            raise DeviceAbsentError(
+                "no device connected",
+                hint="check USB cable / adb authorization (adb devices)")
+        raise AdbError(f"device not ready (state={state})",
+                       hint="check USB cable / adb authorization")
 
     def devices(self) -> list[dict]:
         out = self.sh("devices")
@@ -80,8 +84,10 @@ class Adb:
             if pid:
                 return pid
             time.sleep(0.5)
-        raise AdbError(f"process not found: {package}",
-                       hint="launch the app first, or use connect --launch")
+        raise ProcessNotFoundError(
+            f"process not found: {package}",
+            hint="launch the app first, or use connect --launch",
+            package=package)
 
     def main_activity(self, package: str) -> str:
         out = self.shell(f"cmd package resolve-activity --brief "

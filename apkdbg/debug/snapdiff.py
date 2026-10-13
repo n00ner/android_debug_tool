@@ -189,12 +189,31 @@ def diff_nodes(fa: dict, fb: dict) -> dict:
                              ma.get("incomplete") if side == "a"
                              else mb.get("incomplete"))
         elif t in ("str", "bytes"):
-            if ma["v"] != mb["v"]:
+            # only the common observed prefix is mutually known — a shorter
+            # capture from a smaller budget is not a change when every
+            # observed char/byte agrees
+            common = min(len(ma["v"]), len(mb["v"]))
+            if ma["v"][:common] != mb["v"][:common]:
                 entry = {"a": _repr(ma), "b": _repr(mb)}
                 if ma.get("trunc") or mb.get("trunc"):
                     entry["truncated"] = True  # observed prefixes differ
                 changed[_pstr(path)] = entry
+            elif len(ma["v"]) != len(mb["v"]):
+                a_shorter = len(ma["v"]) < len(mb["v"])
+                if (ma if a_shorter else mb).get("trunc"):
+                    note_unknown(path, "a" if a_shorter else "b",
+                                 "capture budget truncated the observed "
+                                 "prefix; the unobserved suffix cannot be "
+                                 "compared")
+                else:
+                    changed[_pstr(path)] = {"a": _repr(ma), "b": _repr(mb),
+                                            "truncated": True}
             elif t == "bytes" and ma.get("len") != mb.get("len"):
+                changed[_pstr(path)] = {"a": _repr(ma), "b": _repr(mb),
+                                        "truncated": True}
+            elif ma.get("trunc") != mb.get("trunc"):
+                # equal observed prefixes: a truncated value is strictly
+                # longer than observed, a complete one is exactly this
                 changed[_pstr(path)] = {"a": _repr(ma), "b": _repr(mb),
                                         "truncated": True}
         elif t == "array":

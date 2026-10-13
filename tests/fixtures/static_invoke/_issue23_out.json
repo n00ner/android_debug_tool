@@ -1,0 +1,161 @@
+{
+ "android": {
+  "steps": [
+   {
+    "app_local_static_hex": [
+     {
+      "options": 1,
+      "state_before": {
+       "thread_status": 1,
+       "suspend_status": 1,
+       "suspend_count": 1
+      },
+      "method": "hex(Ljava/lang/String;)[B",
+      "reply": {
+       "tag": 91,
+       "v": 4,
+       "exception": 0
+      },
+      "healthy_after": true
+     },
+     {
+      "options": 0,
+      "state_before": {
+       "thread_status": 1,
+       "suspend_status": 1,
+       "suspend_count": 1
+      },
+      "method": "hex(Ljava/lang/String;)[B",
+      "reply": {
+       "tag": 91,
+       "v": 6,
+       "exception": 0
+      },
+      "healthy_after": true
+     }
+    ]
+   },
+   {
+    "platform_parseInt": [
+     {
+      "options": 1,
+      "state_before": {
+       "thread_status": 1,
+       "suspend_status": 1,
+       "suspend_count": 1
+      },
+      "method": "parseInt(Ljava/lang/String;)I",
+      "reply": {
+       "tag": 73,
+       "v": 42,
+       "exception": 0
+      },
+      "healthy_after": true
+     },
+     {
+      "options": 0,
+      "state_before": {
+       "thread_status": 1,
+       "suspend_status": 1,
+       "suspend_count": 1
+      },
+      "method": "parseInt(Ljava/lang/String;)I",
+      "reply": {
+       "tag": 73,
+       "v": 42,
+       "exception": 0
+      },
+      "healthy_after": true
+     }
+    ]
+   },
+   {
+    "negative_control": {
+     "thread_suspend_only": true,
+     "state_before": {
+      "thread_status": 1,
+      "suspend_status": 1,
+      "suspend_count": 2
+     },
+     "error": "JdwpConnError: JDWP connection lost: JDWP socket closed by peer (VM died or debugger detached)",
+     "healthy_after": false
+    }
+   }
+  ],
+  "ro.product.model": "23124RA7EO",
+  "ro.build.version.release": "15",
+  "ro.build.version.sdk": "35",
+  "connect": {
+   "package": "com.apkdbg.cryptofixture",
+   "pid": 26886,
+   "port": 50148,
+   "vm": "Dalvik",
+   "jdwp": "1.8"
+  },
+  "id_sizes": {
+   "field": 8,
+   "method": 8,
+   "object": 8,
+   "reftype": 8,
+   "frame": 8
+  }
+ },
+ "desktop": {
+  "runtime": "desktop JVM (Zulu 21)",
+  "steps": [
+   {
+    "event_suspended_thread": [
+     {
+      "options": 1,
+      "state_before": {
+       "thread_status": 1,
+       "suspend_status": 1,
+       "suspend_count": 1
+      },
+      "method": "answer(Ljava/lang/String;)I",
+      "reply": {
+       "tag": 73,
+       "v": 42,
+       "exception": 0
+      },
+      "healthy_after": true
+     },
+     {
+      "options": 0,
+      "state_before": {
+       "thread_status": 1,
+       "suspend_status": 1,
+       "suspend_count": 1
+      },
+      "method": "answer(Ljava/lang/String;)I",
+      "reply": {
+       "tag": 73,
+       "v": 42,
+       "exception": 0
+      },
+      "healthy_after": true
+     }
+    ]
+   },
+   {
+    "negative_control": {
+     "thread_suspend_only": true,
+     "state_before": {
+      "thread_status": 1,
+      "suspend_status": 1,
+      "suspend_count": 2
+     },
+     "error": "JdwpConnError: JDWP reply timeout cmdset=3 cmd=3",
+     "healthy_after": true
+    }
+   }
+  ],
+  "id_sizes": {
+   "field": 8,
+   "method": 8,
+   "object": 8,
+   "reftype": 8,
+   "frame": 8
+  }
+ }
+}
