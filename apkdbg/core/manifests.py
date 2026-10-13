@@ -6,8 +6,9 @@ A *run* is one investigation capture (coverage run, crypto watch, snapshot,
 generation, tool version, capture configuration, environment/VM metadata,
 scenario label, session epoch, start/end times, and completion reason.
 Runs, events, and artifacts live in their own tables: re-indexing the
-project rewrites only the derived static tables, never old observations,
-and every observation carries the index generation it belongs to.
+project (issue #35) rebuilds only the derived static tables and copies
+these observation rows verbatim into each new index generation; every
+observation keeps the index generation it was captured against.
 
 Identity rules:
   - run/event/artifact ids are durable uuids, stable across export/import;
@@ -47,7 +48,9 @@ def index_generation(db) -> int:
 
 
 def bump_index_generation(db) -> int:
-    """Advance the static-index generation; called by re-indexing so new
+    """Advance the static-index generation counter in place. Re-indexing
+    (issue #35) instead computes the next generation from the live DB and
+    stamps it into the staged replacement database at publish time, so new
     observations are distinguishable from ones captured against the old
     index. Existing runs/events/artifacts keep their recorded generation.
     An absent counter means generation 1 (first init, or a legacy DB)."""
