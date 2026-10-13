@@ -60,6 +60,19 @@ EVK_CLASS_PREPARE = 8
 EVK_METHOD_ENTRY, EVK_METHOD_EXIT, EVK_METHOD_EXIT_RET = 40, 41, 42
 EVK_VM_INIT, EVK_VM_DEATH = 90, 99
 
+# commands with VM-side effects (issue #32): once one of these has been
+# dispatched, the public operation it belongs to is no longer provably
+# unexecuted — a later packet failing pre-dispatch must not trigger a
+# replay. EventRequest set/clear are excluded on purpose: they die with
+# the connection, so their replay can never duplicate an effect.
+STATE_COMMANDS = frozenset({
+    (CS_VM, VM_RESUME), (CS_VM, VM_CREATE_STRING),
+    (CS_THREADREF, TR_RESUME),
+    (CS_STACKFRAME, SF_SETVALUES),
+    (CS_OBJECTREF, OR_SETVALUES), (CS_OBJECTREF, OR_INVOKE),
+    (CS_CLASSTYPE, CT_INVOKE), (CS_CLASSTYPE, 4),  # ClassType.NewInstance
+})
+
 EVENT_KIND_NAMES = {
     1: "single_step", 2: "breakpoint", 4: "exception", 6: "thread_start",
     7: "thread_death", 8: "class_prepare", 40: "method_entry",
@@ -256,6 +269,7 @@ class JdwpClient:
         self._events: queue.Queue = queue.Queue()
         self._alive = False
         self._dead: Exception | None = None
+        self._state_dispatched = 0  # STATE_COMMANDS fully transmitted
         self._reader_t: threading.Thread | None = None
         self.handshake_info: dict = {}
         # Resolution caches for the checked invoke paths (issues #22, #23).
@@ -406,6 +420,8 @@ class JdwpClient:
                 self._pending.pop(pid, None)
                 raise JdwpConnError(f"JDWP send failed: {e}",
                                     phase="transmit") from e
+            if (cmdset, cmd) in STATE_COMMANDS:
+                self._state_dispatched += 1
         if not slot["event"].wait(timeout or self.timeout):
             self._pending.pop(pid, None)
             raise JdwpConnError(
@@ -417,6 +433,14 @@ class JdwpClient:
         if slot["error"]:
             raise JdwpReplyError(slot["error"], cmdset, cmd)
         return Reader(slot["data"], self.sizes)
+
+    @property
+    def state_dispatched(self) -> int:
+        """How many state-changing commands (STATE_COMMANDS) have been
+        fully transmitted on this connection. An op's replay key: a fault
+        after this counter moved means the mutation may already be
+        applied, whatever the failing packet's own phase says."""
+        return self._state_dispatched
 
     # -- VM introspection ------------------------------------------------------
     def classes_by_signature(self, sig: str) -> list[dict]:

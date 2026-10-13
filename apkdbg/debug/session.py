@@ -18,12 +18,19 @@ explicit safety class:
               could have occurred after the command reached the VM (fault
               phase transmit/post-send) the op is NEVER replayed: the
               caller gets OutcomeUnknownError (outcome "unknown") carrying
-              the op name, connection epoch, and recovery state. Only a
-              pre-dispatch fault (dead socket detected before send) is
-              replayed, since the command provably never left the host.
+              the op name, connection epoch, and recovery state. The same
+              applies when ANY state-changing packet of the op was already
+              dispatched (client.state_dispatched moved): a later packet
+              failing pre-dispatch (e.g. result decoding after a
+              successful invoke) cannot undo it. A replay happens only
+              when the fault is pre-dispatch AND nothing state-changing
+              left the host during the whole op — and only for ops without
+              numeric handles: thread/object ids die with the epoch, so a
+              handle-carrying op gets StaleHandleError (re-acquire fresh
+              ids, re-issue) instead of a blind replay.
 
-Op call sites pass _class=/_name=/_reresolve= to _op(); the defaults
-(read, no re-resolve) are the conservative choice.
+Op call sites pass _class=/_name=/_reresolve=/_handles= to _op(); the
+defaults (read, no re-resolve, no handles) are the conservative choice.
 
 Recovery is SCOPED to this session: a failed op rebuilds only this
 session's forward listener and (at most) `adb reconnect`s this device.
@@ -153,23 +160,34 @@ class DebugSession:
             package=self.pkg, pid=self.pid) from last
 
     def _op(self, fn: Callable, *args, _class: str = OP_READ,
-            _name: str | None = None, _reresolve: bool = False, **kwargs):
+            _name: str | None = None, _reresolve: bool = False,
+            _handles: bool = False, **kwargs):
         """Run fn(self.client, ...) under the class-based recovery policy
         documented in the module docstring. _name names the op in
         structured errors; _reresolve marks a read whose inputs are fully
         re-derived from symbolic state on every attempt (only then is a
-        read retried across an epoch boundary)."""
+        read retried across an epoch boundary); _handles marks an op whose
+        inputs are numeric per-connection ids (thread/object/frame), which
+        are dead after a reconnect even when nothing was dispatched."""
+        # duck-typed test doubles do not model packet-level tracking
+        dispatched = getattr(self.client, "state_dispatched", 0)
         try:
             return fn(self.client, *args, **kwargs)
         except JdwpConnError as e:
-            return self._recover_op(e, fn, args, kwargs,
-                                    _class, _name, _reresolve)
+            return self._recover_op(e, fn, args, kwargs, _class, _name,
+                                    _reresolve, _handles, dispatched)
 
     def _recover_op(self, err: JdwpConnError, fn: Callable, args, kwargs,
-                    op_class: str, name: str | None, reresolve: bool):
+                    op_class: str, name: str | None, reresolve: bool,
+                    handles: bool, dispatched: int):
         op = name or getattr(fn, "__name__", "op")
         # untagged conn errors are treated as post-send (conservative)
         phase = err.context.get("phase") or "post-send"
+        # the failing packet's phase alone says nothing about EARLIER
+        # packets of the same op: once any state-changing command was
+        # dispatched, the mutation may already be applied (issue #32)
+        mutated = (getattr(self.client, "state_dispatched", 0)
+                   != dispatched)
         epoch_before = self.events.epoch
         # Process restart is NOT a transport failure (issue #32): every
         # handle, frame, and event request is gone — reconnecting the old
@@ -195,7 +213,8 @@ class DebugSession:
                 recovery = f"reconnect failed: {rec}"
         # A state-changing op whose command may have reached the VM is
         # never replayed — report UNKNOWN instead of guessing either way.
-        uncertain = op_class == OP_STATE and phase != "pre-dispatch"
+        uncertain = op_class == OP_STATE and (mutated
+                                              or phase != "pre-dispatch")
         if uncertain:
             raise OutcomeUnknownError(
                 op, phase=phase, epoch=epoch_before,
@@ -208,6 +227,11 @@ class DebugSession:
             # numeric handles died with the old epoch even when nothing
             # was sent; replaying could address an unrelated object whose
             # id the new connection reused
+            raise StaleHandleError(op, epoch=epoch_before) from err
+        if op_class == OP_STATE and handles:
+            # provably undispatched, but the op's numeric thread/object
+            # ids died with the old epoch: the caller must re-acquire
+            # fresh handles and re-issue — never a blind replay
             raise StaleHandleError(op, epoch=epoch_before) from err
         return fn(self.client, *args, **kwargs)
 
@@ -453,7 +477,7 @@ class DebugSession:
         # UNKNOWN — never transparently replayed (issue #32)
         if thread:
             self._op(lambda c: c.thread_resume(thread),
-                     _class=OP_STATE, _name="resume(thread)")
+                     _class=OP_STATE, _name="resume(thread)", _handles=True)
             return {"resumed": "thread", "thread": thread}
         self._op(lambda c: c.vm_resume(),
                  _class=OP_STATE, _name="resume(vm)")
@@ -478,7 +502,7 @@ class DebugSession:
                 except JdwpConnError:
                     pass  # never mask the original fault phase (issue #32)
             return ev
-        return self._op(do, _class=OP_STATE, _name="step")
+        return self._op(do, _class=OP_STATE, _name="step", _handles=True)
 
     # ----------------------------------------------------------------- frames
     def _frame0(self, c: JdwpClient, thread: int, frame_idx: int = 0) -> dict:
@@ -555,7 +579,8 @@ class DebugSession:
                 and tag == TAG_STRING else value
             c.frame_set_values(thread, fr["frame_id"], [(slot_n, tag, enc)])
             return {"slot": slot_n, "tag": tag, "written": value}
-        return self._op(do, _class=OP_STATE, _name="write_var")
+        return self._op(do, _class=OP_STATE, _name="write_var",
+                        _handles=True)
 
     # ----------------------------------------------------------------- invoke
     def invoke(self, thread: int, obj: int, method: str, sig: str,
@@ -589,7 +614,7 @@ class DebugSession:
         # state-changing: if the reply is lost after the VM ran the
         # method, a replay would execute app code twice — reported as
         # OutcomeUnknownError instead (issue #32)
-        return self._op(do, _class=OP_STATE, _name="invoke")
+        return self._op(do, _class=OP_STATE, _name="invoke", _handles=True)
 
 
 _TYPE_SIGS = {"int": "I", "long": "J", "boolean": "Z", "byte": "B",

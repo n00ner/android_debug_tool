@@ -15,8 +15,8 @@ from apkdbg import commands
 from apkdbg.debug.hooks import crypto
 from apkdbg.debug.session import DebugSession
 from apkdbg.device.jdwp import (
-    CS_VM, EVK_CLASS_PREPARE, SP_ALL, VM_VERSION, JdwpClient, JdwpConnError,
-    JdwpError,
+    CS_VM, EVK_CLASS_PREPARE, SP_ALL, TAG_STRING, VM_CREATE_STRING,
+    VM_VERSION, JdwpClient, JdwpConnError, JdwpError,
 )
 from apkdbg.errors import (
     AttachUnavailableError, OutcomeUnknownError, ProcessDiedError,
@@ -76,6 +76,7 @@ class Conn:
         self.host, self.port = host, port
         self.op_calls = 0
         self.read_calls = 0
+        self.state_dispatched = 0
         self.handshake_info = {"vm_name": "fake",
                                "jdwp_major": 1, "jdwp_minor": 7}
         Conn.made.append(self)
@@ -102,6 +103,7 @@ class FaultClient:
     def __init__(self, phase):
         self.phase = phase
         self.calls = 0
+        self.state_dispatched = 0
 
     def _fault(self):
         self.calls += 1
@@ -202,6 +204,18 @@ class RequestPhaseTests(unittest.TestCase):
         self.assertEqual(cm.exception.context["phase"], "post-send")
         self.assertTrue(c.sock.sent)  # the command fully left the host
 
+    def test_state_command_dispatch_is_tracked(self):
+        # a fully transmitted state-changing command moves the counter
+        # even when its reply is lost; read commands never do
+        c = raw_client(FakeSocket())
+        with self.assertRaises(JdwpConnError):
+            c.request(CS_VM, VM_CREATE_STRING, timeout=0.05)
+        self.assertEqual(c.state_dispatched, 1)
+        c = raw_client(FakeSocket())
+        with self.assertRaises(JdwpConnError):
+            c.request(CS_VM, VM_VERSION, timeout=0.05)
+        self.assertEqual(c.state_dispatched, 0)
+
 
 # ---------------------------------------------------- outcome_unknown path
 class InvokeClient:
@@ -210,6 +224,7 @@ class InvokeClient:
     def __init__(self):
         self.invocations = 0
         self.drop_reply = True
+        self.state_dispatched = 0
 
     def object_reftype(self, obj):
         return (1, 1000)
@@ -218,10 +233,12 @@ class InvokeClient:
         return (1000, 1500)
 
     def create_string(self, s):
+        self.state_dispatched += 1
         return 42
 
     def invoke_object_method(self, obj, thread, cls, mid, args):
         self.invocations += 1  # the VM-side effect happens...
+        self.state_dispatched += 1
         if self.drop_reply:
             self.drop_reply = False
             raise JdwpConnError("reply lost", phase="post-send")  # ...then lost
@@ -232,6 +249,27 @@ class InvokeClient:
 
     def close(self):
         pass
+
+
+class LateFaultInvokeClient(InvokeClient):
+    """The invoke mutation succeeds and returns a String id; decoding that
+    result hits a dead socket. The failing packet (string_value) is
+    pre-dispatch, but the mutation packet already left the host."""
+
+    def __init__(self):
+        super().__init__()
+        self.drop_reply = False
+        self.fault = True
+
+    def invoke_object_method(self, obj, thread, cls, mid, args):
+        super().invoke_object_method(obj, thread, cls, mid, args)
+        return {"value": {"tag": TAG_STRING, "v": 42}, "exception": 0}
+
+    def string_value(self, oid):
+        if self.fault:
+            self.fault = False
+            raise JdwpConnError("dead socket", phase="pre-dispatch")
+        return "x"
 
 
 class OutcomeUnknownTests(unittest.TestCase):
@@ -265,6 +303,26 @@ class OutcomeUnknownTests(unittest.TestCase):
         self.assertEqual(cm.exception.context["phase"], "transmit")
         self.assertEqual(Conn.made[-1].op_calls, 0)
 
+    def test_applied_invoke_late_pre_dispatch_fault_is_never_replayed(self):
+        # the reviewer's scenario: invoke_object_method executed and
+        # returned a String id, then string_value hits a dead socket with
+        # phase=pre-dispatch — the failing packet's phase must not replay
+        # the already-dispatched mutation
+        c = LateFaultInvokeClient()
+        s = make_session(c)
+        epoch0 = s.events.epoch
+        with reset_conn():
+            with self.assertRaises(OutcomeUnknownError) as cm:
+                s.invoke(thread=1, obj=2, method="doFinal",
+                         sig="()Ljava/lang/String;")
+        self.assertEqual(c.invocations, 1)  # executed exactly once
+        ctx = cm.exception.to_dict()["context"]
+        self.assertEqual(ctx["op"], "invoke")
+        self.assertEqual(ctx["phase"], "pre-dispatch")
+        self.assertEqual(ctx["epoch"], epoch0)
+        self.assertEqual(ctx["epoch_new"], epoch0 + 1)
+        self.assertIsInstance(s.client, Conn)  # reconnected, no replay
+
 
 # ------------------------------------------------------------- fault matrix
 class FaultPhaseMatrixTests(unittest.TestCase):
@@ -279,6 +337,48 @@ class FaultPhaseMatrixTests(unittest.TestCase):
         # dead socket detected before send: the command provably never
         # left the host, so even a mutation is replayed once
         s, out = self._run("pre-dispatch", _class="state", _name="mut")
+        self.assertEqual(out, "ok")
+        self.assertEqual(Conn.made[-1].op_calls, 1)
+
+    def test_pre_dispatch_state_op_with_handles_fails_stale(self):
+        # provably undispatched, but the op's numeric thread/object ids
+        # died with the old epoch — re-acquire + re-issue, never a replay
+        s = make_session(FaultClient("pre-dispatch"))
+        with reset_conn():
+            with self.assertRaises(StaleHandleError) as cm:
+                s._op(lambda c: c.op(), _class="state",
+                      _name="resume(thread)", _handles=True)
+        self.assertEqual(cm.exception.to_dict()["code"], "E_STALE_HANDLE")
+        self.assertEqual(Conn.made[-1].op_calls, 0)
+
+    def test_dispatched_reads_do_not_block_replay(self):
+        # only STATE-changing packets arm the tracker: a read packet
+        # dispatched earlier in the same op must not force UNKNOWN when
+        # the mutation itself provably never left the host
+        class ReadThenDead:
+            def __init__(self):
+                self.state_dispatched = 0
+                self.dead = False
+
+            def read_op(self):
+                return "read"
+
+            def op(self):
+                if not self.dead:
+                    self.dead = True
+                    raise JdwpConnError("dead socket", phase="pre-dispatch")
+                return "ok"
+
+            def close(self):
+                pass
+
+        def op(c):
+            c.read_op()  # dispatched read; state_dispatched stays put
+            return c.op()
+
+        s = make_session(ReadThenDead())
+        with reset_conn():
+            out = s._op(op, _class="state", _name="mut")
         self.assertEqual(out, "ok")
         self.assertEqual(Conn.made[-1].op_calls, 1)
 
@@ -336,6 +436,7 @@ class HookClient:
         self.methods = {}
         self.sigs = {}
         self.cleared = []
+        self.state_dispatched = 0
         if crypto_loaded:
             self.classes[CLS_SIG] = [{"type_id": 1000}]
             self.sigs[1000] = CLS_SIG
