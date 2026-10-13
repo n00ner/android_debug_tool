@@ -15,6 +15,7 @@ from .debug.aliascollect import AliasCollector
 from .debug.conditions import ConditionalEngine
 from .debug.coverage import CoverageTracker
 from .debug.hooks import crypto as crypto_hooks
+from .debug.hooks import framework as framework_hooks
 from .debug.hooks import strings as string_hooks
 from .debug.session import DebugSession
 from .debug.snapdiff import snapshot_diff
@@ -395,6 +396,56 @@ def cmd_strings(ctx: Ctx, run_id: str | None = None,
         limit=limit, offset=offset)
 
 
+# --------------------------------------------- framework watchers (issue #27)
+def cmd_watch_framework(ctx: Ctx, duration: float = 60.0,
+                        families: list | None = None,
+                        profiles: list | None = None,
+                        mode: str = "attributed",
+                        scope: str | None = None,
+                        exclude: list | None = None,
+                        invoke_getters: bool = False,
+                        corr_window_ms: int = 250,
+                        max_events: int = 1000,
+                        max_reads: int = 5000,
+                        max_output_bytes: int = 1 << 20,
+                        max_queue: int = 64,
+                        max_stack: int = 8,
+                        max_str: int = 512,
+                        thread: int | None = None,
+                        mod_count: int | None = None,
+                        defer: bool = False,
+                        record: bool = False,
+                        scenario: str | None = None) -> dict:
+    """Opt-in framework watcher profiles (issue #27): navigation requests,
+    SharedPreferences edits, and system-service lookups at the framework
+    methods actually hooked — observation points with explicit coverage
+    notes, never full-coverage claims. families: navigation | storage |
+    services (default all three); profiles narrows/extends with builtin
+    names or explicit {"cls","method","sig"} objects."""
+    return framework_hooks.run_watch(
+        ctx.session, profiles=profiles, families=families, mode=mode,
+        duration_s=duration, scope=scope, exclude=exclude,
+        invoke_getters=invoke_getters, corr_window_ms=corr_window_ms,
+        max_events=max_events, max_reads=max_reads,
+        max_output_bytes=max_output_bytes, max_queue=max_queue,
+        max_stack=max_stack, max_str=max_str, thread=thread,
+        mod_count=mod_count, defer=defer, record=record,
+        scenario=scenario)
+
+
+def cmd_framework_events(ctx: Ctx, run_id: str | None = None,
+                         family: str | None = None,
+                         profile: str | None = None,
+                         role: str | None = None, limit: int = 50,
+                         offset: int = 0) -> dict:
+    """Offline query over persisted framework-watch records (bounded
+    pagination; filters: run, profile family, source profile, role)."""
+    limit, offset = _page(limit, offset)
+    return framework_hooks.query_events(
+        ctx.project, run_id=run_id, family=family, profile=profile,
+        role=role, limit=limit, offset=offset)
+
+
 def cmd_coverage(ctx: Ctx, packages: list[str], mode: str = "method",
                  thread: int | None = None, budget: int = 20000,
                  seconds: int = 60, scenario: str | None = None) -> dict:
@@ -549,6 +600,8 @@ COMMANDS = {
     "hook_crypto": cmd_hook_crypto,
     "watch_strings": cmd_watch_strings,
     "strings": cmd_strings,
+    "watch_framework": cmd_watch_framework,
+    "framework_events": cmd_framework_events,
     "coverage": cmd_coverage,
     "runs": cmd_runs,
     "snapshot_diff": cmd_snapshot_diff,

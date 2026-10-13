@@ -225,6 +225,75 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=50)
     sp.add_argument("--offset", type=int, default=0)
 
+    sp = sub.add_parser("watch_framework",
+                        help="opt-in framework watcher profiles "
+                             "(issue #27)")
+    sp.add_argument("--duration", type=float, default=60.0)
+    sp.add_argument("--families",
+                    help="comma-separated: navigation,storage,services "
+                         "(default: all three)")
+    sp.add_argument("--profiles",
+                    help="JSON array: builtin profile names, family names, "
+                         "and/or explicit {\"cls\",\"method\",\"sig\"} "
+                         "objects (overrides --families)")
+    sp.add_argument("--mode", default="attributed",
+                    choices=["best_effort", "attributed"],
+                    help="best_effort: SP_NONE, no attribution/args, object "
+                         "loss counted; attributed: SP_EVENT_THREAD, "
+                         "args + bounded stack while suspended")
+    sp.add_argument("--scope",
+                    help="app scope for attribution (JDWP class-match "
+                         "pattern, e.g. com.example.*)")
+    sp.add_argument("--exclude",
+                    help="comma-separated class-match patterns excluded "
+                         "from attribution (framework wrappers are never "
+                         "reported as app callers)")
+    sp.add_argument("--invoke-getters", action="store_true",
+                    help="EXPLICIT opt-in: invoke metadata getters "
+                         "(Intent.getAction/getComponent/...) on the "
+                         "suspended thread via the validated invoke path; "
+                         "runs application code — off by default")
+    sp.add_argument("--corr-window-ms", type=int, default=250,
+                    help="one call traversing several watched methods "
+                         "shares a correlation id within this window; "
+                         "0 disables correlation")
+    sp.add_argument("--max-events", type=int, default=1000)
+    sp.add_argument("--max-reads", type=int, default=5000)
+    sp.add_argument("--max-output-bytes", type=int, default=1 << 20)
+    sp.add_argument("--max-queue", type=int, default=64,
+                    help="stop when unrelated stashed composites exceed "
+                         "this (queue pressure)")
+    sp.add_argument("--max-stack", type=int, default=8)
+    sp.add_argument("--max-str", type=int, default=512)
+    sp.add_argument("--thread", type=int,
+                    help="restrict capture to this thread (ThreadOnly "
+                         "request modifier)")
+    sp.add_argument("--mod-count", type=int,
+                    help="MOD_COUNT=N: ONE event after N-1 earlier matches "
+                         "are skipped — NOT a first-N budget")
+    sp.add_argument("--defer", action="store_true",
+                    help="CLASS_PREPARE-watch pending profiles and "
+                         "auto-install when their class loads "
+                         "(custom/late-loaded implementations)")
+    sp.add_argument("--record", action="store_true",
+                    help="persist the watch as a run manifest with one "
+                         "event row per captured record")
+    sp.add_argument("--scenario")
+    sp.add_argument("--pkg")
+
+    sp = sub.add_parser("framework_events",
+                        help="offline query of persisted framework-watch "
+                             "records (issue #27)")
+    sp.add_argument("--run-id")
+    sp.add_argument("--family",
+                    choices=["navigation", "storage", "services", "custom"])
+    sp.add_argument("--profile")
+    sp.add_argument("--role",
+                    choices=["request", "lifecycle", "staged", "submit",
+                             "lookup", "custom"])
+    sp.add_argument("--limit", type=int, default=50)
+    sp.add_argument("--offset", type=int, default=0)
+
     sp = sub.add_parser("coverage", help="branch/method coverage")
     sp.add_argument("--packages", required=True, help="comma-separated")
     sp.add_argument("--mode", default="method", choices=["method", "line"])
@@ -286,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
 SESSION_VERBS = {"bp", "bp_del", "bp_list", "events", "read_var", "write_var",
                  "invoke", "step", "resume", "restore", "snapshot",
                  "dump_object", "cond", "hook_crypto", "watch_strings",
-                 "coverage", "native"}
+                 "watch_framework", "coverage", "native"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -330,6 +399,8 @@ def _kwargs(args: argparse.Namespace) -> dict:
         if k == "no_dedupe":
             k, v = "dedupe", not v
         if k == "hooks" and isinstance(v, str):
+            v = [x.strip() for x in v.split(",") if x.strip()]
+        if k in ("families", "exclude") and isinstance(v, str):
             v = [x.strip() for x in v.split(",") if x.strip()]
         if k == "packages" and isinstance(v, str):
             v = [x.strip() for x in v.split(",") if x.strip()]

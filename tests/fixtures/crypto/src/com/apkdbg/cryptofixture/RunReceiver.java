@@ -23,6 +23,12 @@ public class RunReceiver extends BroadcastReceiver {
     public static final String ACTION_RUN_STRINGS =
             "com.apkdbg.cryptofixture.STRINGS";
     public static final String ACTION_BENCH = "com.apkdbg.cryptofixture.BENCH";
+    public static final String ACTION_FW_STORE =
+            "com.apkdbg.cryptofixture.FW_STORE";
+    public static final String ACTION_FW_SVC =
+            "com.apkdbg.cryptofixture.FW_SVC";
+    public static final String ACTION_FW_BENCH =
+            "com.apkdbg.cryptofixture.FW_BENCH";
     private static final String TAG = "CryptoFixture";
 
     static final byte[] AES_KEY = hex("2b7e151628aed2a6abf7158809cf4f3c");
@@ -42,6 +48,25 @@ public class RunReceiver extends BroadcastReceiver {
             int iters = intent.getIntExtra("iters", 200000);
             long acc = StringWork.hotLoop(iters);
             Log.i(TAG, "BENCH iters=" + iters + " acc=" + acc);
+            return;
+        }
+        if (ACTION_FW_STORE.equals(intent.getAction())
+                || ACTION_FW_SVC.equals(intent.getAction())
+                || ACTION_FW_BENCH.equals(intent.getAction())) {
+            // the receiver context is a ReceiverRestrictedContext (it
+            // disallows getSharedPreferences); the application context is
+            // the real ContextImpl and exercises the same watched paths
+            Context app = ctx.getApplicationContext();
+            if (ACTION_FW_STORE.equals(intent.getAction())) {
+                FrameworkWork.storagePaths(app);
+                FrameworkWork.customEditorPaths();
+            } else if (ACTION_FW_SVC.equals(intent.getAction())) {
+                FrameworkWork.servicePaths(app);
+            } else {
+                int iters = intent.getIntExtra("iters", 50000);
+                long acc = FrameworkWork.benchLoop(app, iters);
+                Log.i(TAG, "FWBENCH iters=" + iters + " acc=" + acc);
+            }
             return;
         }
         if (!ACTION_RUN.equals(intent.getAction())) {
