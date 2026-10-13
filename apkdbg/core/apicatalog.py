@@ -493,6 +493,72 @@ _META: dict[str, dict] = {
                    "scenario": "scenario label for a new run",
                    "event_id": "parent event for the artifact"},
     },
+    "job_start": {
+        "summary": "start a cancellable background job for a long-lived "
+                   "collector (issue #34); the server keeps answering "
+                   "control requests and project-only queries while it "
+                   "runs, and rejects conflicting session operations "
+                   "early (E_JOB_CONFLICT)",
+        "result": "{\"operation_id\", \"command\", \"state\", \"limits\"}; "
+                  "one active job per session — poll job_status, page "
+                  "records with job_read, stop with job_cancel",
+        "mutates": True, "idempotent": False, "retryable": False,
+        "project": True, "session": True,
+        "params": {"command": "job-capable command: hook_crypto | "
+                              "watch_strings | watch_framework | coverage | "
+                              "export_buffer",
+                   "params": "params object for that command, validated "
+                             "against its catalog schema before queuing",
+                   "max_records": "bounded record buffer size; oldest "
+                                  "records expire (exact expired count)",
+                   "max_record_bytes": "bounded buffer bytes; records "
+                                       "beyond it are counted dropped"},
+    },
+    "job_status": {
+        "summary": "lifecycle (queued/running/cancelling/completed/"
+                   "cancelled/failed) + progress of one job",
+        "result": "state, elapsed, exact received/retained/dropped/expired "
+                  "counts; terminal jobs add an immutable outcome "
+                  "(reason: completed | deadline | event_budget | "
+                  "output_budget | cancellation | target_exit | "
+                  "disconnect | capture_failure, incomplete flag) plus "
+                  "result summary or error",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False,
+        "params": {"operation_id": "id returned by job_start"},
+    },
+    "job_read": {
+        "summary": "bounded cursor page of a job's retained records",
+        "result": "{\"records\", count, cursor, received/retained/dropped/"
+                  "expired, truncated}; pages resume without duplicates "
+                  "or omissions; null cursor only on a terminal, exhausted "
+                  "stream (a running job always returns a continuation "
+                  "cursor); an expired cursor fails with "
+                  "E_CURSOR_EXPIRED",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False,
+        "params": {"operation_id": "id returned by job_start",
+                   "cursor": "opaque cursor from the previous reply; omit "
+                             "for the oldest retained page",
+                   "limit": "page size (max 500)"},
+    },
+    "job_cancel": {
+        "summary": "cooperatively cancel a running job; worker teardown "
+                   "clears only the job's own event requests and "
+                   "suspensions",
+        "result": "the job's status record (cancelling, then cancelled); "
+                  "repeated cancels are idempotent",
+        "mutates": True, "idempotent": True, "retryable": True,
+        "project": True, "session": False,
+        "params": {"operation_id": "id returned by job_start"},
+    },
+    "job_list": {
+        "summary": "retained jobs: the active job plus the bounded "
+                   "completed-job retention (evicted oldest-first)",
+        "result": "{\"jobs\": [...], count/total/limit/offset/truncated}",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False, "pagination": True,
+    },
 }
 
 # Hand-written entries for the two protocol methods (no COMMANDS entry).

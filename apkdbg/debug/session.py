@@ -588,10 +588,11 @@ class DebugSession:
                       dest, max_bytes: int = buffers.DEFAULT_MAX_BYTES,
                       chunk_size: int = buffers.DEFAULT_CHUNK_SIZE,
                       deadline: float | None = None, capped: bool = False,
-                      keep_partial: bool = False) -> dict:
+                      keep_partial: bool = False, cancel=None) -> dict:
         """Bounded binary export of a byte[] / heap ByteBuffer (pure reads).
         The caller must pass the connection epoch the handle came from: a
-        mismatch is a stale handle and fails BEFORE any read or file."""
+        mismatch is a stale handle and fails BEFORE any read or file.
+        cancel: cooperative cancellation (issue #34), any is_set() object."""
         if epoch != self.events.epoch:
             raise StaleHandleError(
                 "export_buffer", epoch=epoch,
@@ -602,7 +603,7 @@ class DebugSession:
             return buffers.BufferExporter(
                 c, chunk_size=chunk_size, max_bytes=max_bytes,
                 deadline_s=deadline, keep_partial=keep_partial,
-                capped=capped).export(
+                capped=capped, cancel=cancel).export(
                 obj, source=source, offset=offset, length=length, dest=dest)
         # read-only, but the object handle is a numeric id of the current
         # epoch: after a reconnect the caller gets StaleHandleError, never

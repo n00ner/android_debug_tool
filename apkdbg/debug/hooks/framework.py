@@ -1001,7 +1001,8 @@ def run_watch(session, profiles=None, families=None,
               invoke_getters: bool = False, corr_window_ms: int = 250,
               thread: int | None = None, mod_count: int | None = None,
               defer: bool = False, record: bool = False,
-              scenario: str | None = None, cancel=None) -> dict:
+              scenario: str | None = None, cancel=None,
+              on_record=None) -> dict:
     """Blocking framework-watch loop: install the selected profiles
     (families: navigation|storage|services — default all three; explicit
     profile names/custom dicts narrow or extend the selection), then
@@ -1011,7 +1012,10 @@ def run_watch(session, profiles=None, families=None,
 
     Claims only its own events (unrelated stops are stashed for the
     public wait_events caller, whose consumer owns their suspensions).
-    Cooperative cancellation via any object with is_set(). Teardown
+    Cooperative cancellation via any object with is_set(); while `cancel`
+    is passed, event waits are sliced so a cancel is observed within ~1s.
+    on_record is an optional sink called with each emitted record
+    (issue #34). Teardown
     clears every owned request with its original kind while the transport
     epoch is unchanged; after a reconnect the old ids are reported in
     "unconfirmed" and the remote is left untouched (issue #32). Capture
@@ -1079,6 +1083,8 @@ def run_watch(session, profiles=None, families=None,
             return
         records.append(rec)
         out_bytes += len(json.dumps(rec, default=str))
+        if on_record is not None:
+            on_record(rec)
         # budgets apply mid-composite too: once exhausted, further events
         # of the batch are counted dropped (not read) and the loop stops
         if cfg["_stats"]["reads"] >= max_reads:
@@ -1098,10 +1104,16 @@ def run_watch(session, profiles=None, families=None,
             if cancel is not None and cancel.is_set():
                 reason = "cancelled"
                 break
+            wait = max(1.0, deadline - time.time())
+            if cancel is not None:
+                wait = min(wait, 1.0)  # sliced: cancel visible within ~1s
             try:
-                r = d.next_routed(
-                    timeout=max(1.0, deadline - time.time()))
+                r = d.next_routed(timeout=wait)
             except Exception as e:
+                if cancel is not None \
+                        and getattr(e, "code", None) == "E_JDWP_TIMEOUT" \
+                        and time.time() < deadline:
+                    continue  # sliced wait expired; the window has not
                 if getattr(e, "code", None) != "E_JDWP_TIMEOUT":
                     reason = "error"
                     errors.append(f"wait: {str(e)[:120]}")

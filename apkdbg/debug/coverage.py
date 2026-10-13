@@ -125,7 +125,10 @@ class CoverageTracker:
         self._finalized = False
 
     # ------------------------------------------------------------------ run
-    def run(self) -> dict:
+    def run(self, cancel=None) -> dict:
+        """cancel: cooperative cancellation (issue #34) — any object with
+        is_set(); while passed, event waits are sliced so a cancel is
+        observed within ~1s, and the stop reason is "cancelled"."""
         c = self.session.client
         d = self.session.events
         # durable run manifest (issue #36): same run_id the coverage_hits
@@ -158,12 +161,22 @@ class CoverageTracker:
 
         sub = d.subscribe(owner, self._on_event, request_ids={rid})
         deadline = time.time() + self.seconds
+        cancelled = False
         try:
             while self._events < self.budget and time.time() < deadline:
+                if cancel is not None and cancel.is_set():
+                    cancelled = True
+                    break
+                wait = max(1.0, deadline - time.time())
+                if cancel is not None:
+                    wait = min(wait, 1.0)  # sliced: cancel visible ~1s
                 try:
-                    r = d.next_routed(
-                        timeout=max(1.0, deadline - time.time()))
-                except Exception:
+                    r = d.next_routed(timeout=wait)
+                except Exception as e:
+                    if cancel is not None \
+                            and getattr(e, "code", None) == "E_JDWP_TIMEOUT" \
+                            and time.time() < deadline:
+                        continue  # sliced wait expired; the window has not
                     break
                 if r["events"]:
                     d.stash(r)  # not ours: preserve for wait_events
@@ -173,7 +186,10 @@ class CoverageTracker:
         rep = self.report()
         # both stop conditions mean the capture is a bounded sample, not an
         # exhaustive trace: it stays explicitly incomplete (issue #37)
-        reason = "budget" if self._events >= self.budget else "duration"
+        if cancelled:
+            reason = "cancelled"
+        else:
+            reason = "budget" if self._events >= self.budget else "duration"
         rep["stop_reason"] = reason
         rep["complete"] = False
         rep["dropped_events"] = self._dropped
