@@ -8,7 +8,7 @@ import re
 import shlex
 import time
 
-from ..errors import AdbError
+from ..errors import AdbError, DeviceAbsentError, ProcessNotFoundError
 from ..util import find_binary, run
 
 
@@ -42,10 +42,14 @@ class Adb:
     # -- device state -------------------------------------------------------
     def ensure_device(self) -> str:
         state = self.sh("get-state", check=False)
-        if state != "device":
-            raise AdbError(f"device not ready (state={state or 'none'})",
-                           hint="check USB cable / adb authorization")
-        return state
+        if state == "device":
+            return state
+        if not state:  # adb prints "error: no devices/emulators found" on stderr
+            raise DeviceAbsentError(
+                "no device connected",
+                hint="check USB cable / adb authorization (adb devices)")
+        raise AdbError(f"device not ready (state={state})",
+                       hint="check USB cable / adb authorization")
 
     def devices(self) -> list[dict]:
         out = self.sh("devices")
@@ -80,8 +84,10 @@ class Adb:
             if pid:
                 return pid
             time.sleep(0.5)
-        raise AdbError(f"process not found: {package}",
-                       hint="launch the app first, or use connect --launch")
+        raise ProcessNotFoundError(
+            f"process not found: {package}",
+            hint="launch the app first, or use connect --launch",
+            package=package)
 
     def main_activity(self, package: str) -> str:
         out = self.shell(f"cmd package resolve-activity --brief "
@@ -129,13 +135,18 @@ class Adb:
 
     def reconnect(self) -> None:
         """Recover from stale adbd/host state (e.g. a previous debugger
-        detached uncleanly and the VM refuses new JDWP handshakes)."""
+        detached uncleanly and the VM refuses new JDWP handshakes).
+        Scoped to this instance's selected device (`adb -s <serial>
+        reconnect`) — never a global server restart."""
         self.sh("reconnect", check=False, timeout=20)
 
     def kill_server(self) -> None:
-        """Last-resort recovery: restart the host adb daemon. Clears stale
-        jdwp-forward bookkeeping that survives `adb reconnect` (observed on
-        MIUI/adbd 1.0.41)."""
+        """Last-resort recovery: restart the host adb daemon. GLOBAL —
+        every attached device and debug session is affected, so the
+        session layer calls this only on explicit user request
+        (connect(recovery="kill-server")), never as a silent fallback.
+        Clears stale jdwp-forward bookkeeping that survives
+        `adb reconnect` (observed on MIUI/adbd 1.0.41)."""
         run([self.bin, "kill-server"], timeout=15, tool="adb", check=False)
 
     def push(self, local: str, remote: str, timeout: int = 120) -> None:

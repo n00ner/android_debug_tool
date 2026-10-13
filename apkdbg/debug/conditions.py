@@ -107,41 +107,84 @@ def _entropy(data: bytes) -> float:
 
 
 class ConditionalEngine:
-    """Runs a capture-evaluate-resume loop until the predicate matches."""
+    """Runs a capture-evaluate-resume loop until the predicate matches.
+
+    Events are consumed through the session dispatcher: the engine claims
+    only its own breakpoints' events (subscription narrowed to its request
+    ids), stashes everything else back for the public wait_events
+    interface, and lets the composite lease release non-matching
+    suspensions. On a match the thread is RETAINED on the lease — the stop
+    is user-owned and left suspended for inspection."""
 
     def __init__(self, session):
         self.session = session
 
     def run(self, spec: str, predicate: dict, capture: list[dict], *,
-            max_events: int = 2000, timeout_s: float = 120.0) -> dict:
+            max_events: int = 2000, timeout_s: float = 120.0,
+            collect_aliases: bool = False) -> dict:
         bp = self.session.set_breakpoint(spec, suspend_all=False)
-        rids = [b["request_id"] for b in bp["breakpoints"]]
-        rid_set = set(rids)
-        deadline = time.time() + timeout_s
+        rids = {b["request_id"] for b in bp["breakpoints"]}
+        d = self.session.events
         checked = 0
+        match: dict = {}
+        collector = None
+        if collect_aliases:
+            from ..core.aliases import AliasStore
+            from .aliascollect import AliasCollector
+            collector = AliasCollector(
+                self.session, store=AliasStore.for_session(self.session))
+
+        def on_event(ev: dict, lease) -> None:
+            nonlocal checked
+            thread = ev.get("thread")
+            if thread is None:
+                return
+            checked += 1
+            c = self.session.client
+            fr = c.thread_frames(thread, 1)[0]
+            captured = capture_spec(c, thread, fr["frame_id"], capture)
+            if collector is not None:
+                # already-captured values only: no extra reads here; the
+                # lease owns the suspension (issue #25)
+                collector.collect_from_record(
+                    captured,
+                    {"class_sig": ev.get("class_sig"),
+                     "method_name": (ev.get("breakpoint") or {}).get("method"),
+                     "epoch": d.epoch},
+                    client=None)
+            if evaluate(predicate, captured):
+                match.update(
+                    {"matched": True, "checked": checked,
+                     "at": {k: ev["breakpoint"].get(k) for k in
+                            ("spec", "java_line", "method")}
+                     if ev.get("breakpoint") else None,
+                     "captured": captured, "thread": thread,
+                     "note": "thread left suspended for inspection"})
+                lease.retain(thread)  # user-owned stop: do not auto-resume
+
+        sub = d.subscribe("user", on_event, request_ids=rids)
+        deadline = time.time() + timeout_s
         try:
-            while checked < max_events and time.time() < deadline:
-                ev = self.session.wait_events(
-                    timeout=max(1.0, deadline - time.time()))
-                for e in ev["events"]:
-                    if e["request_id"] not in rid_set or "thread" not in e:
-                        continue
-                    checked += 1
-                    thread = e["thread"]
-                    c = self.session.client
-                    fr = c.thread_frames(thread, 1)[0]
-                    captured = capture_spec(c, thread, fr["frame_id"], capture)
-                    if evaluate(predicate, captured):
-                        return {"matched": True, "checked": checked,
-                                "at": {k: e["breakpoint"].get(k) for k in
-                                       ("spec", "java_line", "method")}
-                                       if e.get("breakpoint") else None,
-                                "captured": captured, "thread": thread,
-                                "note": "thread left suspended for inspection"}
-                    self.session.resume(thread=thread)
-            return {"matched": False, "checked": checked,
-                    "reason": "budget" if checked >= max_events else "timeout"}
+            while not match and checked < max_events \
+                    and time.time() < deadline:
+                try:
+                    r = d.next_routed(
+                        timeout=max(1.0, deadline - time.time()))
+                except Exception:
+                    break
+                if r["events"]:
+                    d.stash(r)  # not ours: preserve for wait_events
+            if match:
+                if collector is not None:
+                    match["alias_collection"] = collector.report()
+                return match
+            out = {"matched": False, "checked": checked,
+                   "reason": "budget" if checked >= max_events else "timeout"}
+            if collector is not None:
+                out["alias_collection"] = collector.report()
+            return out
         finally:
+            sub.close()
             for rid in rids:
                 try:
                     self.session.delete_breakpoint(rid)

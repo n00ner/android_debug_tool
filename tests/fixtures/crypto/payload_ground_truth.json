@@ -1,0 +1,7 @@
+{
+ "asset": "encrypted_dex.bin",
+ "key_hex": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+ "iv_hex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+ "plaintext_len": 684,
+ "plaintext_sha256": "74d8f1eee01fe8d1b8cf8ec36c2c7556db43a4d8f207f71a6e73c7cdf9d07749"
+}

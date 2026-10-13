@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 
+from ..core.aliases import accepted_alias
 from ..core.database import MappingDB
 from ..errors import ResolveError
 
@@ -105,6 +106,10 @@ def resolve(db: MappingDB, spec: str) -> dict:
 
     return {
         "class": row["fqcn"], "deobf": row["deobf_fqcn"], "sig": sig,
+        # accepted runtime alias (issue #25): a distinct, review-only
+        # annotation next to sig/deobf — never an input to resolution,
+        # method matching, or breakpoint targeting
+        "alias": accepted_alias(db, sig),
         "java_line": line, "dalvik_line": dalvik_line,
         "smali": {"path": row["smali_path"],
                   "line": smali["smali_line"] if smali else None},

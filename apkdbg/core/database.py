@@ -17,6 +17,17 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+# Mapping-DB schema/index versions, persisted in the meta table by init.
+# Bump SCHEMA_VERSION on any table/column change (future migrations key off
+# the stored value); INDEX_VERSION on index-generation logic changes.
+SCHEMA_VERSION = "2"
+
+# Static-index format/provenance version, recorded as meta.index_version
+# (issue #35). Databases without the key are version 1: pre-#35 builds with
+# non-transactional in-place re-indexing. Opening a DB with a NEWER version
+# than this constant is an error; older versions are rebuilt by `init`.
+INDEX_VERSION = 2
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 
@@ -99,19 +110,209 @@ CREATE TABLE IF NOT EXISTS coverage_hits (
   run_id      TEXT NOT NULL,
   class_sig   TEXT,
   method_name TEXT,
+  method_sig  TEXT,               -- full descriptor: ()V — overloads stay
+                                  -- separate rows (issue #37)
   dalvik_line INTEGER,
   hits        INTEGER DEFAULT 0,
-  UNIQUE(run_id, class_sig, method_name, dalvik_line)
+  UNIQUE(run_id, class_sig, method_name, method_sig, dalvik_line)
+);
+
+-- observed branch-site outcomes per coverage run (issue #29): taken /
+-- fallthrough / unknown are stored separately, unknowns keep their reasons
+-- and are never resolved into edges after the fact. Site identity is the
+-- descriptor-level site_key (class->name(desc):dalvik_line:smali_line) —
+-- the local integer branch_sites.id is not portable between rebuilt
+-- indexes, so it is not persisted. Rows join to runs for the APK hash /
+-- index generation they were captured against.
+CREATE TABLE IF NOT EXISTS coverage_branch_sites (
+  id           INTEGER PRIMARY KEY,
+  run_id       TEXT NOT NULL,
+  site_key     TEXT NOT NULL,
+  class_sig    TEXT,
+  method_name  TEXT,
+  method_sig   TEXT,
+  dalvik_line  INTEGER,
+  smali_line   INTEGER,
+  opcode       TEXT,
+  kind         TEXT,            -- if | goto | switch
+  site_hits    INTEGER DEFAULT 0,
+  taken        INTEGER DEFAULT 0,
+  fallthrough  INTEGER DEFAULT 0,
+  unknowns     TEXT,            -- JSON {reason: count}; absent means none
+  UNIQUE(run_id, site_key)
+);
+
+-- investigation run manifests (issue #36): durable identity for runtime
+-- observations, stored independently of the replaceable static index
+-- (init rebuilds the derived tables above in a staged generation and
+-- carries these rows across unchanged; they are additive)
+CREATE TABLE IF NOT EXISTS runs (
+  run_id            TEXT PRIMARY KEY,   -- durable id (uuid), stable across export/import
+  manifest_version  INTEGER NOT NULL,
+  kind              TEXT NOT NULL,      -- coverage | snapshot | crypto_watch | ...
+  scenario          TEXT,               -- free-form scenario label
+  apk_sha256        TEXT,
+  index_generation  INTEGER NOT NULL,   -- static-index generation at capture time
+  tool_version      TEXT,
+  capture_config    TEXT,               -- JSON: mode/packages/budgets/hooks/scope
+  environment       TEXT,               -- JSON: device, android api, vm name/version
+  epoch             INTEGER,            -- connection epoch of the capturing session
+  started_at        TEXT,
+  ended_at          TEXT,
+  completion_reason TEXT,               -- completed | duration | budget | max_events | ...
+  counts            TEXT                -- JSON counters (events, hits, errors)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  event_id         TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  index_generation INTEGER NOT NULL,    -- copied from the run at capture time
+  epoch            INTEGER,             -- connection epoch of the capturing session
+  kind             TEXT NOT NULL,       -- crypto_record | ...
+  class_sig        TEXT,                -- original runtime descriptor (identity)
+  method_name      TEXT,                -- original (possibly obfuscated) name
+  method_sig       TEXT,
+  dalvik_line      INTEGER,
+  bytecode_index   INTEGER,
+  payload          TEXT NOT NULL        -- JSON record body (deobf names are
+                                        -- annotations inside, never identity)
+);
+CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+  artifact_id      TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  parent_event_id  TEXT,                -- optional parent event
+  kind             TEXT NOT NULL,       -- snapshot | coverage_report | export | ...
+  format           TEXT NOT NULL,       -- json | ...
+  index_generation INTEGER NOT NULL,
+  epoch            INTEGER,
+  budgets          TEXT,                -- JSON capture budgets
+  truncation       TEXT,                -- JSON: trunc/budget/error summary
+  errors           TEXT,                -- JSON list
+  checksum         TEXT,                -- sha256 of body
+  body             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+
+-- runtime alias candidates (issue #25): evidence-backed naming hypotheses.
+-- SEPARATE from classes.deobf_fqcn and imported mappings, which are never
+-- touched by this feature; candidate text is a reviewable annotation, never
+-- an identity, and never participates in method/breakpoint resolution.
+CREATE TABLE IF NOT EXISTS alias_candidates (
+  candidate_id     TEXT PRIMARY KEY,    -- durable id (uuid)
+  apk_sha256       TEXT,                -- APK identity at observation time
+  index_generation INTEGER NOT NULL,    -- static-index generation at capture
+  class_sig        TEXT NOT NULL,       -- original runtime class descriptor
+  method_name      TEXT,                -- set for method-scoped candidates
+  method_sig       TEXT,                -- full method descriptor when scoped
+  classloader_id   INTEGER,             -- loader object id (per-connection, informational)
+  classloader_key  TEXT,                -- epoch:loader identity; distinct loaders
+                                        -- of one class_sig stay separate rows
+  candidate        TEXT NOT NULL,       -- proposed alias text
+  heuristic_score  REAL,                -- heuristic strength, NOT a calibrated
+                                        -- probability (NULL for manual aliases)
+  rule             TEXT NOT NULL,       -- rule id that produced the candidate
+  rules_version    INTEGER NOT NULL,    -- versioned rule set (see core/aliases)
+  source           TEXT NOT NULL,       -- collector | manual
+  run_id           TEXT,                -- producing run (NULL for manual)
+  event_id         TEXT,                -- producing event (NULL for manual)
+  evidence         TEXT NOT NULL,       -- JSON refs: event/run/artifact/label
+  observations     INTEGER NOT NULL DEFAULT 1,  -- dedupe keeps frequency
+  first_seen       TEXT NOT NULL,
+  last_seen        TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'suggested',  -- suggested | accepted |
+                                        -- rejected | superseded
+  created_at       TEXT NOT NULL,
+  decided_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_alias_entity
+  ON alias_candidates(class_sig, method_name, method_sig);
+CREATE INDEX IF NOT EXISTS idx_alias_status ON alias_candidates(status);
+
+-- full decision trail per candidate (accept/reject/revise/supersede and
+-- re-suggestion suppression); replacements are reversible from this history
+CREATE TABLE IF NOT EXISTS alias_decisions (
+  id            INTEGER PRIMARY KEY,
+  candidate_id  TEXT NOT NULL REFERENCES alias_candidates(candidate_id),
+  action        TEXT NOT NULL,          -- suggest | resuggest_merged |
+                                        -- resuggest_suppressed | manual_add |
+                                        -- accept | reject | revise | supersede
+  from_status   TEXT,
+  to_status     TEXT NOT NULL,
+  note          TEXT,
+  decided_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alias_decisions_cand
+  ON alias_decisions(candidate_id);
+
+-- runtime artifacts recovered during debugging (issue #28): validated DEX
+-- payloads discovered at loading/decryption boundaries. Observation data
+-- only, keyed by content hash — additive to the static index, which is
+-- never replaced or merged with runtime content; carried across
+-- re-indexing like the other observation tables.
+CREATE TABLE IF NOT EXISTS runtime_artifacts (
+  artifact_key     TEXT PRIMARY KEY,  -- content sha256 (dedupe identity)
+  kind             TEXT NOT NULL,     -- dex | ...
+  sha256           TEXT NOT NULL,
+  file_size        INTEGER,
+  path             TEXT,              -- host-side exported file
+  origin           TEXT,              -- JSON: run/event/artifact, boundary, epoch
+  validation       TEXT,              -- JSON full-validation summary
+  apk_sha256       TEXT,              -- project APK identity (context only)
+  index_generation INTEGER NOT NULL,
+  first_seen       TEXT NOT NULL,
+  observations     INTEGER NOT NULL DEFAULT 1,
+  last_seen        TEXT NOT NULL
 );
 """
 
 
 class MappingDB:
+    """SQLite handle over the mapping schema.
+
+    Context-manager protocol is transaction-safe (issue #35): exiting the
+    `with` block commits only when no exception occurred; on exception the
+    pending transaction is rolled back, so a failed parser/insertion never
+    persists a partially rebuilt index.
+    """
+
     def __init__(self, path: str | Path):
         self.path = Path(path)
+        fresh = not self.path.exists()
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        if fresh:
+            # stamp new databases with the current index format version;
+            # pre-existing DBs keep whatever provenance they were built with
+            self.conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value)"
+                " VALUES('index_version',?)", (str(INDEX_VERSION),))
+            self.conn.commit()
+        self._migrate_coverage_hits()
+
+    def _migrate_coverage_hits(self) -> None:
+        """Issue #37: pre-#37 coverage_hits has no method_sig column and a
+        unique key that merges overloads. Rebuild the table additively —
+        legacy rows carry method_sig NULL, nothing is dropped."""
+        cols = {r["name"] for r in
+                self.conn.execute("PRAGMA table_info(coverage_hits)")}
+        if not cols or "method_sig" in cols:
+            return
+        self.conn.executescript(
+            "ALTER TABLE coverage_hits RENAME TO coverage_hits_legacy;"
+            "CREATE TABLE coverage_hits ("
+            " id INTEGER PRIMARY KEY, run_id TEXT NOT NULL,"
+            " class_sig TEXT, method_name TEXT, method_sig TEXT,"
+            " dalvik_line INTEGER, hits INTEGER DEFAULT 0,"
+            " UNIQUE(run_id, class_sig, method_name, method_sig,"
+            " dalvik_line));"
+            "INSERT INTO coverage_hits(id,run_id,class_sig,method_name,"
+            "dalvik_line,hits) SELECT id,run_id,class_sig,method_name,"
+            "dalvik_line,hits FROM coverage_hits_legacy;"
+            "DROP TABLE coverage_hits_legacy;")
+        self.conn.commit()
 
     def execute(self, sql: str, params=()) -> sqlite3.Cursor:
         return self.conn.execute(sql, params)
@@ -137,12 +338,21 @@ class MappingDB:
     def commit(self) -> None:
         self.conn.commit()
 
+    def rollback(self) -> None:
+        self.conn.rollback()
+
     def close(self) -> None:
+        """Commit pending changes and close. Prefer the context manager:
+        `__exit__` rolls back instead of committing on exception."""
         self.conn.commit()
         self.conn.close()
 
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
