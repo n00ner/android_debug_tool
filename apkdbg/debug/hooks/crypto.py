@@ -66,6 +66,7 @@ import time
 from ...device.jdwp import (
     EVK_BREAKPOINT, EVK_METHOD_EXIT_RET, SP_EVENT_THREAD, JdwpClient,
 )
+from ...core.manifests import RunStore, capture_environment
 from ...errors import ResolveError, SessionError
 from ...protocol import log_progress
 from ..capture import (
@@ -382,7 +383,9 @@ def run_watch(session, duration_s: float = 60.0,
               capture_returns: bool = False,
               max_events: int = 1000,
               max_bytes: int = 1 << 20,
-              defer: bool = False) -> dict:
+              defer: bool = False,
+              record: bool = False,
+              scenario: str | None = None) -> dict:
     """Blocking watch loop: install hooks, then consume crypto-owned events
     through the session dispatcher for duration_s (bounded by max_events
     records / max_bytes of captured JSON). The loop claims only its own
@@ -394,7 +397,13 @@ def run_watch(session, duration_s: float = 60.0,
     every exit path. If the connection was re-established mid-watch, the
     dead epoch's requests are reported in "unconfirmed" and the remote is
     left untouched. Capture/cleanup failures are reported in the result,
-    never swallowed."""
+    never swallowed.
+
+    With record=True (and a project-backed session), the watch is persisted
+    as a versioned run manifest (issue #36): capture config, completion
+    reason, and counters on the run; one event row per captured record
+    (bounded by max_events), keyed by the hook's original class/method
+    descriptor. The result gains a "run_id" key."""
     d = session.events
     epoch = d.epoch
     rep = install(session, names=names, capture_returns=capture_returns,
@@ -463,4 +472,36 @@ def run_watch(session, duration_s: float = 60.0,
             "reason": reason, "truncated": reason == "max_bytes",
             "captured_bytes": captured_bytes, "unrelated": unrelated,
             "unconfirmed": unconfirmed,
-            "errors": errors, "cleanup_errors": cleanup_errors}
+            "errors": errors, "cleanup_errors": cleanup_errors,
+            "run_id": _record_run(
+                session, epoch, records, reason, unrelated, errors,
+                {"duration_s": duration_s, "names": names,
+                 "capture_returns": capture_returns,
+                 "max_events": max_events, "max_bytes": max_bytes,
+                 "defer": defer}, record, scenario)}
+
+
+def _record_run(session, epoch: int, records: list, reason: str,
+                unrelated: int, errors: list, capture_config: dict,
+                record: bool, scenario: str | None) -> str | None:
+    """Persist the watch as a run manifest with one event row per record
+    (issue #36); None when recording is off or the session has no project.
+    Event identity uses the hook's original class/method descriptor —
+    never runtime ids."""
+    store = RunStore.for_session(session) if record else None
+    if store is None:
+        return None
+    run_id = store.begin_run(
+        "crypto_watch", capture_config=capture_config, scenario=scenario,
+        epoch=epoch, environment=capture_environment(session))
+    hooks = {h["name"]: h for h in CRYPTO_HOOKS}
+    for rec in records:
+        hook = hooks.get(rec.get("hook"), {})
+        store.add_event(run_id, "crypto_record", rec,
+                        class_sig=hook.get("cls"),
+                        method_name=hook.get("method"),
+                        method_sig=hook.get("sig"), epoch=epoch)
+    store.end_run(run_id, reason,
+                  counts={"hits": len(records), "unrelated": unrelated,
+                          "errors": len(errors)})
+    return run_id

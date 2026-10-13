@@ -27,6 +27,12 @@ composite finished); SP_NONE method-mode events never resume. Events owned
 by others (user breakpoints, crypto hooks) are never consumed or resumed —
 they are stashed back for the public wait_events interface, whose caller
 owns resume responsibility.
+
+Every run is also persisted as a versioned run manifest (issue #36, see
+core/manifests.py) when the session has a project: the run_id the
+coverage_hits rows already carry becomes the manifest's durable identity,
+with capture config, environment, epoch, and completion reason recorded,
+and the final report stored as a run artifact.
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from ..device.jdwp import (
     EVK_METHOD_ENTRY, EVK_SINGLE_STEP, SP_EVENT_THREAD, SP_NONE,
     STEP_INTO, STEP_LINE, JdwpClient,
 )
+from ..core.manifests import RunStore, capture_environment
 from ..errors import SessionError
 
 DEFAULT_BUDGET = 20000
@@ -47,7 +54,8 @@ DEFAULT_SECONDS = 60
 class CoverageTracker:
     def __init__(self, session, packages: list[str], *,
                  mode: str = "method", thread: int | None = None,
-                 budget: int = DEFAULT_BUDGET, seconds: int = DEFAULT_SECONDS):
+                 budget: int = DEFAULT_BUDGET, seconds: int = DEFAULT_SECONDS,
+                 scenario: str | None = None):
         if mode not in ("method", "line"):
             raise SessionError(f"bad coverage mode {mode!r}",
                                hint="method | line")
@@ -59,6 +67,7 @@ class CoverageTracker:
         self.packages = packages
         self.mode, self.thread = mode, thread
         self.budget, self.seconds = budget, seconds
+        self.scenario = scenario
         self.run_id = uuid.uuid4().hex[:8]
         self.method_hits: dict[str, int] = {}
         self.line_hits: dict[str, dict[int, int]] = {}
@@ -71,6 +80,18 @@ class CoverageTracker:
     def run(self) -> dict:
         c = self.session.client
         d = self.session.events
+        # durable run manifest (issue #36): same run_id the coverage_hits
+        # rows already carry, now with full capture conditions; skipped for
+        # project-less sessions
+        store = RunStore.for_session(self.session)
+        if store is not None:
+            store.begin_run(
+                "coverage", run_id=self.run_id, scenario=self.scenario,
+                capture_config={"mode": self.mode, "packages": self.packages,
+                                "budget": self.budget, "seconds": self.seconds,
+                                "thread": self.thread},
+                epoch=d.epoch,
+                environment=capture_environment(self.session))
         mods = [c.mod_class_match(f"{p}.*") for p in self.packages]
         if self.mode == "method":
             kind, policy = EVK_METHOD_ENTRY, SP_NONE
@@ -101,7 +122,18 @@ class CoverageTracker:
         finally:
             sub.close()
             self.session.clear_request(rid)  # kind-correct, epoch-checked
-        return self.report()
+        rep = self.report()
+        if store is not None:
+            reason = "budget" if self._events >= self.budget else "duration"
+            store.end_run(self.run_id, reason,
+                          counts={"events": self._events,
+                                  "methods": len(self.method_hits),
+                                  "lines": sum(len(v) for v in
+                                               self.line_hits.values())})
+            store.add_artifact(self.run_id, "coverage_report", rep,
+                               epoch=d.epoch)
+            rep["recorded"] = True
+        return rep
 
     def _on_event(self, e: dict, lease) -> None:
         if "location" not in e:

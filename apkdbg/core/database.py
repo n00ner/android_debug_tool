@@ -109,6 +109,58 @@ CREATE TABLE IF NOT EXISTS coverage_hits (
   hits        INTEGER DEFAULT 0,
   UNIQUE(run_id, class_sig, method_name, dalvik_line)
 );
+
+-- investigation run manifests (issue #36): durable identity for runtime
+-- observations, stored independently of the replaceable static index
+-- (init only ever rewrites the derived tables above; these are additive)
+CREATE TABLE IF NOT EXISTS runs (
+  run_id            TEXT PRIMARY KEY,   -- durable id (uuid), stable across export/import
+  manifest_version  INTEGER NOT NULL,
+  kind              TEXT NOT NULL,      -- coverage | snapshot | crypto_watch | ...
+  scenario          TEXT,               -- free-form scenario label
+  apk_sha256        TEXT,
+  index_generation  INTEGER NOT NULL,   -- static-index generation at capture time
+  tool_version      TEXT,
+  capture_config    TEXT,               -- JSON: mode/packages/budgets/hooks/scope
+  environment       TEXT,               -- JSON: device, android api, vm name/version
+  epoch             INTEGER,            -- connection epoch of the capturing session
+  started_at        TEXT,
+  ended_at          TEXT,
+  completion_reason TEXT,               -- completed | duration | budget | max_events | ...
+  counts            TEXT                -- JSON counters (events, hits, errors)
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  event_id         TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  index_generation INTEGER NOT NULL,    -- copied from the run at capture time
+  epoch            INTEGER,             -- connection epoch of the capturing session
+  kind             TEXT NOT NULL,       -- crypto_record | ...
+  class_sig        TEXT,                -- original runtime descriptor (identity)
+  method_name      TEXT,                -- original (possibly obfuscated) name
+  method_sig       TEXT,
+  dalvik_line      INTEGER,
+  bytecode_index   INTEGER,
+  payload          TEXT NOT NULL        -- JSON record body (deobf names are
+                                        -- annotations inside, never identity)
+);
+CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+  artifact_id      TEXT PRIMARY KEY,
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  parent_event_id  TEXT,                -- optional parent event
+  kind             TEXT NOT NULL,       -- snapshot | coverage_report | export | ...
+  format           TEXT NOT NULL,       -- json | ...
+  index_generation INTEGER NOT NULL,
+  epoch            INTEGER,
+  budgets          TEXT,                -- JSON capture budgets
+  truncation       TEXT,                -- JSON: trunc/budget/error summary
+  errors           TEXT,                -- JSON list
+  checksum         TEXT,                -- sha256 of body
+  body             TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
 """
 
 

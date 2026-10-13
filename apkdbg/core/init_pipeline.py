@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..decompile import mappings, smali_index, tools
 from ..protocol import log_progress
+from . import manifests
 from .database import INDEX_VERSION, SCHEMA_VERSION
 from .project import Project
 
@@ -56,9 +57,16 @@ def run_init(apk: str | Path, project_root: str | Path, *,
                 [(r["res_id"], r["type"], r["name"]) for r in res])
             summary["resources"] = len(res)
 
-            # smali index (idempotent: derived tables are rebuilt from scratch)
+            # smali index (idempotent: derived tables are rebuilt from scratch;
+            # observation tables — runs/events/artifacts/coverage_hits — are
+            # never touched, and the generation marks which index new
+            # observations belong to, see core/manifests.py)
             for t in ("line_map", "branch_sites", "resource_refs", "jadx_lines"):
                 db.execute(f"DELETE FROM {t}")
+            if db.get_meta("index_generation") is None:
+                db.set_meta("index_generation", "1")  # first index
+            else:
+                manifests.bump_index_generation(db)   # re-index
             n_cls = n_meth = n_lines = n_branch = n_refs = 0
             for smali_root, path in smali_index.iter_smali_files(proj.apktool_dir):
                 rel = f"{smali_root}/{path.relative_to(proj.apktool_dir / smali_root)}"
