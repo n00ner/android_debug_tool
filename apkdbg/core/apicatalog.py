@@ -81,6 +81,14 @@ _META: dict[str, dict] = {
         "project": True, "session": False, "pagination": True,
         "params": {"id": "resource id, decimal or 0x-prefixed hex"},
     },
+    "capabilities": {
+        "summary": "offline capability matrix for this project/APK; "
+                   "probe=true adds live device/runtime observations",
+        "result": "capability states with index facts and reasons",
+        "mutates": False, "idempotent": True, "retryable": True,
+        "project": True, "session": False,
+        "params": {"probe": "also probe the live device/runtime"},
+    },
     "connect": {
         "summary": "attach JDWP to the app (optionally launch it first)",
         "result": "session info: pkg, pid, port, handshake metadata",
@@ -473,17 +481,20 @@ def _build_entry(name: str, fn) -> dict:
 
 
 def entry_for(name: str) -> dict | None:
-    """Catalog entry for a command or protocol method, or None."""
-    if name in _PROTOCOL_ENTRIES:
-        return _PROTOCOL_ENTRIES[name]
+    """Catalog entry for a command or protocol method, or None. A command
+    shadows a same-named protocol method (the command is the richer,
+    parameter-bearing surface)."""
     fn = COMMANDS.get(name)
-    return _build_entry(name, fn) if fn is not None else None
+    if fn is not None:
+        return _build_entry(name, fn)
+    return _PROTOCOL_ENTRIES.get(name)
 
 
 def catalog() -> dict:
     """The full catalog: every COMMANDS entry plus the protocol methods."""
     entries = [_build_entry(name, fn) for name, fn in COMMANDS.items()]
-    entries += list(_PROTOCOL_ENTRIES.values())
+    entries += [e for name, e in _PROTOCOL_ENTRIES.items()
+                if name not in COMMANDS]
     return {"catalog_version": CATALOG_VERSION, "tool_version": __version__,
             "commands": entries}
 
