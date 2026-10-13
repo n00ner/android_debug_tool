@@ -342,7 +342,12 @@ def _direction_change(key, kind, ga, gb) -> dict | None:
 
 
 def _norm_values(g: dict) -> list[float]:
-    return [r["normalized"] for r in g["runs"].values()]
+    """Per-run normalized hit counts, including zero for runs that did not
+    observe the key: absence inside the captured sample is a 0.0 sample,
+    so the spread reflects repeat noise and the A/A guard can suppress
+    differences within it."""
+    values = [r["normalized"] for r in g["runs"].values()]
+    return values + [0.0] * (g["total"] - len(values))
 
 
 def _hitcount_change(key, kind, ga, gb) -> dict | None:
