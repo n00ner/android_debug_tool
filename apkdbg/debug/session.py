@@ -46,6 +46,7 @@ import time
 from typing import Callable
 
 from ..core.project import Project
+from ..core.capabilities import index_facts
 from ..device.adb import Adb
 from ..device.jdwp import (
     EVK_BREAKPOINT, EVK_SINGLE_STEP, SP_ALL, SP_EVENT_THREAD,
@@ -53,8 +54,8 @@ from ..device.jdwp import (
     JdwpClient, JdwpConnError, JdwpError, sig_to_tag, TAG_STRING,
 )
 from ..errors import (
-    OutcomeUnknownError, ProcessDiedError, ResolveError, SessionError,
-    StaleHandleError,
+    AttachUnavailableError, LineMappingError, OutcomeUnknownError,
+    ProcessDiedError, ResolveError, SessionError, StaleHandleError,
 )
 from ..protocol import log_progress
 from . import translate
@@ -143,7 +144,13 @@ class DebugSession:
                 return
             except JdwpConnError as e:
                 last = e
-        raise last
+        raise AttachUnavailableError(
+            f"JDWP attach failed after recovery attempts: {last}",
+            hint="the VM refused the JDWP handshake — the app may be "
+                 "non-debuggable (android:debuggable=false on a "
+                 "ro.debuggable=0 device), or a previous debugger detached "
+                 "uncleanly; run 'capabilities --probe' for live observations",
+            package=self.pkg, pid=self.pid) from last
 
     def _op(self, fn: Callable, *args, _class: str = OP_READ,
             _name: str | None = None, _reresolve: bool = False, **kwargs):
@@ -224,6 +231,18 @@ class DebugSession:
           5. EventRequest.Set(BREAKPOINT, suspend, [LocationOnly(location)])
         """
         with self.project.db() as db:
+            lm = index_facts(db)["line_map"]
+            if lm["state"] != "complete":
+                raise LineMappingError(
+                    f"source-line breakpoint requires a verified "
+                    f"source-to-runtime line map (state={lm['state']}, "
+                    f"reason={lm['reason']})",
+                    hint="the static line map is empty or incomplete — a "
+                         "java:line cannot be verified against .line "
+                         "directives; use smali/method-entry coordinates "
+                         "instead, or re-run init and check 'capabilities' "
+                         "for the recorded reason",
+                    line_map_state=lm["state"], line_map_reason=lm["reason"])
             res = translate.resolve(db, spec)
         placed = self._place(res, spec, suspend_all)
         return {"resolved": res, "breakpoints": placed}

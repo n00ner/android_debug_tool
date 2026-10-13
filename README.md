@@ -53,6 +53,7 @@ Key design decisions:
 
 | Table | Purpose | Key columns |
 |---|---|---|
+| `meta` | persistent APK/index facts (written by `init`) | `schema_version`, `index_version`, `index_complete`, `index_warnings`, `line_map_state`/`line_map_reason`, `manifest_debuggable`, `apk`/`sha256`/`package` |
 | `classes` | runtime class identity | `sig` (`Lcom/foo/Bar;`), `fqcn`, `deobf_fqcn`, `smali_path` |
 | `methods` | methods per class | `name`, `sig`, `is_native`, smali `line_start/line_end` |
 | `line_map` | `.line N` directives | `method_id`, `dalvik_line`, `smali_line` |
@@ -64,10 +65,11 @@ Key design decisions:
 
 ## Command surface
 
-Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`.
-Session (use `serve` mode for multi-step): `connect`, `restore`, `bp`, `bp_del`,
-`bp_list`, `events`, `read_var`, `write_var`, `invoke`, `step`, `resume`,
-`snapshot`, `dump_object`, `cond`, `hook_crypto`, `coverage`, `native`.
+Stateless (CLI-safe): `init`, `classes`, `methods`, `res`, `res_refs`,
+`capabilities`. Session (use `serve` mode for multi-step): `connect`,
+`restore`, `bp`, `bp_del`, `bp_list`, `events`, `read_var`, `write_var`,
+`invoke`, `step`, `resume`, `snapshot`, `dump_object`, `cond`,
+`hook_crypto`, `coverage`, `native`.
 
 ```bash
 # 1. init: decompile + build mapping DB

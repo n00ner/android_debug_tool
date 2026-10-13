@@ -36,7 +36,7 @@ from ..decompile import mappings, smali_index, tools
 from ..errors import DecompileError, MappingError
 from ..protocol import log_progress
 from . import manifests
-from .database import INDEX_VERSION, MappingDB
+from .database import INDEX_VERSION, SCHEMA_VERSION, MappingDB
 from .project import Project, _remove_db_files, _remove_sidecars
 
 # historical runtime observations (issue #36): retained across re-indexing,
@@ -119,11 +119,17 @@ def run_init(apk: str | Path, project_root: str | Path, *,
             apktool_src / "AndroidManifest.xml")
         if pkg:
             summary["package"] = pkg
+        debuggable = mappings.parse_manifest_debuggable(
+            apktool_src / "AndroidManifest.xml")
+        md_str = {True: "true", False: "false", None: "unknown"}[debuggable]
+        summary["manifest_debuggable"] = md_str
 
         # 2. build + validate the staging database ----------------------------
         counts = _build_staging_db(
             proj, apktool_src=apktool_src, jadx_mapping=jadx_mapping,
             live=live, summary=summary)
+        lm_state, lm_reason = _line_map_state(counts["classes"],
+                                              counts["line_rows"])
         provenance = {
             "apk_sha256": sha,
             "index_version": INDEX_VERSION,
@@ -139,15 +145,28 @@ def run_init(apk: str | Path, project_root: str | Path, *,
             staging.set_meta("sha256", sha)
             if pkg:
                 staging.set_meta("package", pkg)
+            staging.set_meta("manifest_debuggable", md_str)
+            staging.set_meta("schema_version", SCHEMA_VERSION)
             staging.set_meta("index_version", str(INDEX_VERSION))
             staging.set_meta("index_generation", str(generation))
+            # an aborted build never publishes, so a published generation is
+            # always complete; tolerated per-file failures land in warnings
+            staging.set_meta("index_complete", "true")
+            staging.set_meta("index_warnings", json.dumps(counts["warnings"]))
+            staging.set_meta("line_map_state", lm_state)
+            staging.set_meta("line_map_reason", lm_reason)
+            staging.set_meta("indexed_at", provenance["indexed_at"])
+            staging.set_meta("tools", json.dumps(
+                decompilers, separators=(",", ":"), ensure_ascii=False))
             staging.set_meta("provenance", json.dumps(
                 provenance, separators=(",", ":"), ensure_ascii=False))
         _remove_sidecars(proj.staging_db_path)  # fold away WAL sidecars
 
         # 3. publish: one complete generation, atomically selected ------------
         _publish(proj, swap_apktool=not skip_apktool,
-                 swap_jadx=not skip_jadx)
+                 swap_jadx=not skip_jadx,
+                 db_identity={"sha256": sha,
+                              "index_generation": str(generation)})
     except Exception:
         if not proj.publish_journal_path.exists():
             # failure while staging: discard the incomplete generation
@@ -157,9 +176,12 @@ def run_init(apk: str | Path, project_root: str | Path, *,
         raise
 
     summary.update({"generation": generation, "index_version": INDEX_VERSION,
-                    **counts, "elapsed_s": round(time.time() - t0, 2)})
+                    **counts, "index_complete": True,
+                    "line_map": {"state": lm_state, "reason": lm_reason},
+                    "elapsed_s": round(time.time() - t0, 2)})
     proj.save_state(**{k: summary[k] for k in
-                       ("apk", "sha256", "package") if k in summary})
+                       ("apk", "sha256", "package", "manifest_debuggable")
+                       if k in summary})
     log_progress(f"init complete: generation {generation}, "
                  f"{counts['classes']} classes, {counts['methods']} methods")
     return summary
@@ -230,10 +252,17 @@ def _build_staging_db(proj: Project, *, apktool_src: Path,
             [(r["res_id"], r["type"], r["name"]) for r in res])
 
         # smali index
+        warnings: list[str] = []
+        n_files = 0
         n_cls = n_meth = n_lines = n_branch = n_refs = 0
         for smali_root, path in smali_index.iter_smali_files(apktool_src):
+            n_files += 1
             rel = f"{smali_root}/{path.relative_to(apktool_src / smali_root)}"
-            parsed = smali_index.parse_smali_file(path)
+            try:
+                parsed = smali_index.parse_smali_file(path)
+            except Exception as e:  # one bad file must not abort the index
+                warnings.append(f"smali parse failed: {rel}: {e}")
+                continue
             if not parsed["sig"]:
                 continue
             fqcn = parsed["sig"][1:-1].replace("/", ".")
@@ -272,6 +301,13 @@ def _build_staging_db(proj: Project, *, apktool_src: Path,
                         (rc["res_id"], mid, rc["fl"], rc["dl"], rc["kind"]))
                     n_refs += 1
 
+        if warnings and len(warnings) == n_files:
+            # systemic parse failure: never publish an empty index over a
+            # healthy prior generation
+            raise MappingError(
+                f"smali parsing failed for all {n_files} files",
+                hint=warnings[0])
+
         # jadx mappings (deobf names + optional java<->dalvik lines)
         n_deobf = n_jlines = 0
         for obf, deobf in jadx_mapping["names"].items():
@@ -299,7 +335,7 @@ def _build_staging_db(proj: Project, *, apktool_src: Path,
     return {"resources": len(res), "classes": n_cls, "methods": n_meth,
             "line_rows": n_lines, "branch_sites": n_branch,
             "resource_refs": n_refs, "deobf_classes": n_deobf,
-            "jadx_line_rows": n_jlines}
+            "jadx_line_rows": n_jlines, "warnings": warnings}
 
 
 def _copy_observations(staging: MappingDB, live_db_path: Path) -> None:
@@ -368,11 +404,14 @@ def _validate_staging(db: MappingDB) -> None:
 
 
 # ------------------------------------------------------------------ publication
-def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool) -> None:
+def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool,
+             db_identity: dict) -> None:
     """Atomically select the staged generation. Journaled: a crash anywhere
     in here is resolved by Project.recover_interrupted_publish(). The DB
     swap is last-but-cleanup and a single os.replace — the point at which
-    the new generation becomes visible."""
+    the new generation becomes visible. db_identity (the staged DB's
+    provenance meta) is journaled up front, so recovery can tell whether
+    the os.replace committed even when the db_swapped write did not."""
     swaps = []
     if swap_apktool:
         swaps.append((proj.apktool_staging_dir, proj.apktool_dir,
@@ -382,6 +421,7 @@ def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool) -> None:
                       proj.jadx_old_dir))
     journal = {"swap": [{"live": str(live), "old": str(old)}
                         for _, live, old in swaps],
+               "db_identity": db_identity,
                "dirs_swapped": False, "db_swapped": False}
     _write_journal(proj, journal)
 
@@ -409,8 +449,20 @@ def _publish(proj: Project, *, swap_apktool: bool, swap_jadx: bool) -> None:
 
 
 def _write_journal(proj: Project, journal: dict) -> None:
-    proj.publish_journal_path.write_text(
-        json.dumps(journal, indent=1), "utf-8")
+    tmp = proj.publish_journal_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(journal, indent=1), "utf-8")
+    os.replace(tmp, proj.publish_journal_path)
+
+
+def _line_map_state(n_cls: int, n_lines: int) -> tuple[str, str]:
+    """Availability AND reason, recorded separately: zero rows after a
+    completed index is NOT proof of stripped debug info by itself — it only
+    says the smali carried no .line directives."""
+    if n_lines > 0:
+        return "complete", "ok"
+    if n_cls > 0:
+        return "empty", "no_line_directives"
+    return "unknown", "no_classes_indexed"
 
 
 def _sha256(path: Path) -> str:
